@@ -128,11 +128,21 @@ jobs:
           - Do NOT use Markdown.
           - Do NOT include html/head/body tags.
 
-          Return ONLY valid JSON:
+          VERY IMPORTANT:
+
+          Return ONLY valid JSON.
+
+          Escape all quotation marks inside HTML attributes
+          correctly.
+
+          Do not put literal newlines or control characters
+          inside JSON string values.
+
+          JSON FORMAT:
 
           {{
             "seo_title": "Article title",
-            "html_content": "<p>...</p>",
+            "html_content": "<p>Article HTML here</p>",
             "labels": [
               "Crypto",
               "Bitcoin",
@@ -144,7 +154,47 @@ jobs:
           """
 
           # ==================================================
-          # 3. ARTICLE GENERATION WITH RETRY
+          # 3. CLEAN GEMINI JSON
+          # ==================================================
+
+          def clean_json_text(text):
+
+              text = text.strip()
+
+              # Remove markdown code fences
+              text = re.sub(
+                  r"^```(?:json)?\s*",
+                  "",
+                  text,
+                  flags=re.IGNORECASE
+              )
+
+              text = re.sub(
+                  r"\s*```$",
+                  "",
+                  text
+              )
+
+              text = text.strip()
+
+              # Find the actual JSON object
+              start = text.find("{")
+              end = text.rfind("}")
+
+              if start != -1 and end != -1:
+                  text = text[start:end + 1]
+
+              # Remove problematic control characters
+              text = re.sub(
+                  r"[\x00-\x08\x0b\x0c\x0e-\x1f]",
+                  " ",
+                  text
+              )
+
+              return text.strip()
+
+          # ==================================================
+          # 4. ARTICLE GENERATION WITH RETRY
           # ==================================================
 
           def generate_article():
@@ -167,14 +217,17 @@ jobs:
                       }
                   ],
                   "generationConfig": {
-                      "temperature": 0.4,
+                      "temperature": 0.3,
                       "responseMimeType": "application/json"
                   }
               }
 
               max_attempts = 6
 
-              for attempt in range(1, max_attempts + 1):
+              for attempt in range(
+                  1,
+                  max_attempts + 1
+              ):
 
                   print(
                       f"ARTICLE ATTEMPT "
@@ -205,7 +258,7 @@ jobs:
                               response.raise_for_status()
 
                           wait_time = min(
-                              15 * (2 ** (attempt - 1)),
+                              20 * (2 ** (attempt - 1)),
                               180
                           )
 
@@ -222,12 +275,114 @@ jobs:
 
                       data = response.json()
 
-                      text = (
-                          data["candidates"][0]
-                          ["content"]["parts"][0]["text"]
+                      candidates = data.get(
+                          "candidates",
+                          []
                       )
 
-                      return json.loads(text)
+                      if not candidates:
+                          raise Exception(
+                              "Gemini returned no candidates."
+                          )
+
+                      parts = (
+                          candidates[0]
+                          .get("content", {})
+                          .get("parts", [])
+                      )
+
+                      text = ""
+
+                      for part in parts:
+                          if "text" in part:
+                              text += part["text"]
+
+                      if not text:
+                          raise Exception(
+                              "Gemini returned empty article text."
+                          )
+
+                      cleaned = clean_json_text(text)
+
+                      try:
+
+                          article = json.loads(
+                              cleaned,
+                              strict=False
+                          )
+
+                      except json.JSONDecodeError as json_error:
+
+                          print(
+                              "JSON parsing failed."
+                          )
+
+                          print(
+                              "Trying JSON repair..."
+                          )
+
+                          # Replace remaining raw newlines
+                          # inside the response
+                          cleaned = cleaned.replace(
+                              "\r",
+                              " "
+                          ).replace(
+                              "\n",
+                              " "
+                          ).replace(
+                              "\t",
+                              " "
+                          )
+
+                          article = json.loads(
+                              cleaned,
+                              strict=False
+                          )
+
+                      if not isinstance(
+                          article,
+                          dict
+                      ):
+                          raise Exception(
+                              "Gemini response is not a JSON object."
+                          )
+
+                      if not article.get(
+                          "seo_title"
+                      ):
+                          raise Exception(
+                              "Missing seo_title."
+                          )
+
+                      if not article.get(
+                          "html_content"
+                      ):
+                          raise Exception(
+                              "Missing html_content."
+                          )
+
+                      return article
+
+                  except json.JSONDecodeError as error:
+
+                      if attempt == max_attempts:
+                          raise Exception(
+                              "Gemini returned invalid JSON "
+                              "after multiple attempts."
+                          ) from error
+
+                      wait_time = min(
+                          10 * attempt,
+                          60
+                      )
+
+                      print(
+                          "Invalid JSON received. "
+                          f"Waiting {wait_time} seconds "
+                          "before retry..."
+                      )
+
+                      time.sleep(wait_time)
 
                   except (
                       requests.exceptions.Timeout,
@@ -238,12 +393,12 @@ jobs:
                           raise error
 
                       wait_time = min(
-                          15 * (2 ** (attempt - 1)),
+                          20 * (2 ** (attempt - 1)),
                           180
                       )
 
                       print(
-                          "Gemini connection/timeout error. "
+                          "Gemini connection error. "
                           f"Waiting {wait_time} seconds..."
                       )
 
@@ -257,12 +412,25 @@ jobs:
 
           title = article["seo_title"]
           content = article["html_content"]
-          labels = article.get("labels", [])
 
-          print("ARTICLE TITLE:", title)
+          labels = article.get(
+              "labels",
+              [
+                  "Crypto",
+                  "Bitcoin",
+                  "Cryptocurrency News",
+                  "Market Analysis",
+                  "Blockchain"
+              ]
+          )
+
+          print(
+              "ARTICLE TITLE:",
+              title
+          )
 
           # ==================================================
-          # 4. IMAGE FILES
+          # 5. CREATE IMAGE DIRECTORY
           # ==================================================
 
           image_dir = "generated-images"
@@ -289,7 +457,7 @@ jobs:
           )
 
           # ==================================================
-          # 5. IMAGE GENERATION WITH RETRY
+          # 6. IMAGE GENERATION WITH RETRY
           # ==================================================
 
           def generate_image(
@@ -314,7 +482,10 @@ jobs:
 
               max_attempts = 6
 
-              for attempt in range(1, max_attempts + 1):
+              for attempt in range(
+                  1,
+                  max_attempts + 1
+              ):
 
                   print(
                       f"IMAGE ATTEMPT "
@@ -352,7 +523,7 @@ jobs:
                           )
 
                           print(
-                              f"Gemini image API returned "
+                              f"Image API returned "
                               f"{response.status_code}. "
                               f"Waiting {wait_time} seconds..."
                           )
@@ -396,9 +567,9 @@ jobs:
                       with open(
                           output_file,
                           "wb"
-                      ) as f:
+                      ) as image_file:
 
-                          f.write(
+                          image_file.write(
                               base64.b64decode(
                                   image_data
                               )
@@ -425,7 +596,7 @@ jobs:
                       )
 
                       print(
-                          "Image connection/timeout error. "
+                          "Image connection error. "
                           f"Waiting {wait_time} seconds..."
                       )
 
@@ -436,10 +607,11 @@ jobs:
               )
 
           # ==================================================
-          # 6. HERO IMAGE
+          # 7. GENERATE HERO IMAGE
           # ==================================================
 
           generate_image(
+
               f"""
           Create an original editorial illustration
           for a professional cryptocurrency news publication.
@@ -463,14 +635,16 @@ jobs:
           Wide 16:9 composition.
           Suitable as a blog article hero image.
           """,
+
               image1_file
           )
 
           # ==================================================
-          # 7. SECOND IMAGE
+          # 8. GENERATE SECOND IMAGE
           # ==================================================
 
           generate_image(
+
               f"""
           Create a second original editorial image
           for this cryptocurrency article:
@@ -494,11 +668,12 @@ jobs:
           Professional financial journalism aesthetic.
           Wide 16:9 composition.
           """,
+
               image2_file
           )
 
           # ==================================================
-          # 8. PUSH IMAGES TO GITHUB
+          # 9. PUSH GENERATED IMAGES TO GITHUB
           # ==================================================
 
           os.system(
@@ -507,173 +682,4 @@ jobs:
 
           os.system(
               "git config user.email "
-              "'coinsignal-bot@users.noreply.github.com'"
-          )
-
-          os.system(
-              "git add generated-images/"
-          )
-
-          commit_result = os.system(
-              f'git commit -m "Add article images {stamp}"'
-          )
-
-          if commit_result == 0:
-
-              push_result = os.system(
-                  "git push"
-              )
-
-              if push_result != 0:
-                  raise Exception(
-                      "Failed to push images to GitHub."
-                  )
-
-          # ==================================================
-          # 9. IMAGE URLS
-          # ==================================================
-
-          repo_owner = "waqas4868"
-          repo_name = "coinsignal-auto-blog"
-          branch = "main"
-
-          image1_url = (
-              "https://raw.githubusercontent.com/"
-              f"{repo_owner}/{repo_name}/"
-              f"{branch}/{image1_file}"
-          )
-
-          image2_url = (
-              "https://raw.githubusercontent.com/"
-              f"{repo_owner}/{repo_name}/"
-              f"{branch}/{image2_file}"
-          )
-
-          # ==================================================
-          # 10. INSERT IMAGES
-          # ==================================================
-
-          hero_html = f"""
-          <figure>
-            <img
-              src="{image1_url}"
-              alt="{title} cryptocurrency market illustration"
-              style="width:100%;height:auto;border-radius:8px;">
-            <figcaption>{title}</figcaption>
-          </figure>
-          """
-
-          second_html = f"""
-          <figure>
-            <img
-              src="{image2_url}"
-              alt="{title} blockchain and crypto market analysis illustration"
-              style="width:100%;height:auto;border-radius:8px;">
-            <figcaption>
-              Crypto market analysis and blockchain illustration
-            </figcaption>
-          </figure>
-          """
-
-          paragraphs = content.split("</p>")
-
-          if len(paragraphs) >= 4:
-
-              content = (
-                  paragraphs[0]
-                  + "</p>"
-                  + hero_html
-                  + "</p>".join(
-                      paragraphs[1:3]
-                  )
-                  + "</p>"
-                  + second_html
-                  + "</p>".join(
-                      paragraphs[3:]
-                  )
-              )
-
-          else:
-
-              content = (
-                  hero_html
-                  + content
-                  + second_html
-              )
-
-          # ==================================================
-          # 11. BLOGGER TOKEN
-          # ==================================================
-
-          token_response = requests.post(
-              "https://oauth2.googleapis.com/token",
-              data={
-                  "client_id":
-                      os.environ["GOOGLE_CLIENT_ID"],
-                  "client_secret":
-                      os.environ["GOOGLE_CLIENT_SECRET"],
-                  "refresh_token":
-                      os.environ["GOOGLE_REFRESH_TOKEN"],
-                  "grant_type":
-                      "refresh_token"
-              },
-              timeout=60
-          )
-
-          token_response.raise_for_status()
-
-          access_token = (
-              token_response.json()
-              ["access_token"]
-          )
-
-          # ==================================================
-          # 12. PUBLISH TO BLOGGER
-          # ==================================================
-
-          blogger_url = (
-              "https://www.googleapis.com/"
-              "blogger/v3/blogs/"
-              f"{BLOG_ID}/posts"
-          )
-
-          post = {
-              "kind": "blogger#post",
-              "title": title,
-              "content": content,
-              "labels": labels
-          }
-
-          publish_response = requests.post(
-              blogger_url,
-              headers={
-                  "Authorization":
-                      f"Bearer {access_token}",
-                  "Content-Type":
-                      "application/json"
-              },
-              params={
-                  "isDraft": "false"
-              },
-              json=post,
-              timeout=120
-          )
-
-          publish_response.raise_for_status()
-
-          result = publish_response.json()
-
-          print("===================================")
-          print("SUCCESS")
-          print("Title:", title)
-          print(
-              "Blogger URL:",
-              result.get("url")
-          )
-          print("Image 1:", image1_url)
-          print("Image 2:", image2_url)
-          print("Labels:", labels)
-          print("===================================")
-
-          PY
-```0
+              "'coinsignal-bot@users.
