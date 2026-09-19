@@ -79,22 +79,16 @@ jobs:
           source_context = ""
 
           for i, item in enumerate(entries, 1):
-
-              title = item.get("title", "")
-              url = item.get("link", "")
-              summary = item.get("summary", "")
-              published = item.get("published", "")
-
               source_context += f"""
           SOURCE {i}
-          Title: {title}
-          Date: {published}
-          URL: {url}
-          Summary: {summary}
+          Title: {item.get("title", "")}
+          Date: {item.get("published", "")}
+          URL: {item.get("link", "")}
+          Summary: {item.get("summary", "")}
           """
 
           # ==================================================
-          # 2. GENERATE ARTICLE
+          # 2. ARTICLE PROMPT
           # ==================================================
 
           prompt = f"""
@@ -118,11 +112,10 @@ jobs:
           CoinSignal article.
 
           Requirements:
-
           - Create an SEO-friendly title.
           - Use H2 and H3 headings.
           - Use short mobile-friendly paragraphs.
-          - Base factual claims only on the supplied sources.
+          - Base factual claims only on supplied sources.
           - Do not invent prices, statistics, quotes,
             regulations, partnerships, events or market data.
           - Clearly distinguish reported facts from analysis.
@@ -150,18 +143,20 @@ jobs:
           }}
           """
 
-          text_endpoint = (
-              "https://generativelanguage.googleapis.com/v1beta/"
-              f"models/{GEMINI_MODEL}:generateContent"
-              f"?key={GEMINI_API_KEY}"
-          )
+          # ==================================================
+          # 3. ARTICLE GENERATION WITH RETRY
+          # ==================================================
 
-          response = requests.post(
-              text_endpoint,
-              headers={
-                  "Content-Type": "application/json"
-              },
-              json={
+          def generate_article():
+
+              endpoint = (
+                  "https://generativelanguage.googleapis.com/"
+                  "v1beta/models/"
+                  f"{GEMINI_MODEL}:generateContent"
+                  f"?key={GEMINI_API_KEY}"
+              )
+
+              payload = {
                   "contents": [
                       {
                           "parts": [
@@ -175,20 +170,90 @@ jobs:
                       "temperature": 0.4,
                       "responseMimeType": "application/json"
                   }
-              },
-              timeout=120
-          )
+              }
 
-          response.raise_for_status()
+              max_attempts = 6
 
-          data = response.json()
+              for attempt in range(1, max_attempts + 1):
 
-          text = (
-              data["candidates"][0]
-              ["content"]["parts"][0]["text"]
-          )
+                  print(
+                      f"ARTICLE ATTEMPT "
+                      f"{attempt}/{max_attempts}"
+                  )
 
-          article = json.loads(text)
+                  try:
+
+                      response = requests.post(
+                          endpoint,
+                          headers={
+                              "Content-Type":
+                                  "application/json"
+                          },
+                          json=payload,
+                          timeout=180
+                      )
+
+                      if response.status_code in (
+                          429,
+                          500,
+                          502,
+                          503,
+                          504
+                      ):
+
+                          if attempt == max_attempts:
+                              response.raise_for_status()
+
+                          wait_time = min(
+                              15 * (2 ** (attempt - 1)),
+                              180
+                          )
+
+                          print(
+                              f"Gemini returned "
+                              f"{response.status_code}. "
+                              f"Waiting {wait_time} seconds..."
+                          )
+
+                          time.sleep(wait_time)
+                          continue
+
+                      response.raise_for_status()
+
+                      data = response.json()
+
+                      text = (
+                          data["candidates"][0]
+                          ["content"]["parts"][0]["text"]
+                      )
+
+                      return json.loads(text)
+
+                  except (
+                      requests.exceptions.Timeout,
+                      requests.exceptions.ConnectionError
+                  ) as error:
+
+                      if attempt == max_attempts:
+                          raise error
+
+                      wait_time = min(
+                          15 * (2 ** (attempt - 1)),
+                          180
+                      )
+
+                      print(
+                          "Gemini connection/timeout error. "
+                          f"Waiting {wait_time} seconds..."
+                      )
+
+                      time.sleep(wait_time)
+
+              raise Exception(
+                  "Article generation failed."
+              )
+
+          article = generate_article()
 
           title = article["seo_title"]
           content = article["html_content"]
@@ -197,7 +262,7 @@ jobs:
           print("ARTICLE TITLE:", title)
 
           # ==================================================
-          # 3. CREATE IMAGE DIRECTORY
+          # 4. IMAGE FILES
           # ==================================================
 
           image_dir = "generated-images"
@@ -224,7 +289,7 @@ jobs:
           )
 
           # ==================================================
-          # 4. GEMINI IMAGE GENERATION WITH RETRY
+          # 5. IMAGE GENERATION WITH RETRY
           # ==================================================
 
           def generate_image(
@@ -232,7 +297,7 @@ jobs:
               output_file
           ):
 
-              image_endpoint = (
+              endpoint = (
                   "https://generativelanguage.googleapis.com/"
                   "v1beta/interactions"
               )
@@ -247,137 +312,134 @@ jobs:
                   }
               }
 
-              max_attempts = 5
+              max_attempts = 6
 
-              for attempt in range(
-                  1,
-                  max_attempts + 1
-              ):
+              for attempt in range(1, max_attempts + 1):
 
                   print(
                       f"IMAGE ATTEMPT "
                       f"{attempt}/{max_attempts}"
                   )
 
-                  r = requests.post(
-                      image_endpoint,
-                      headers={
-                          "Content-Type":
-                              "application/json",
-                          "x-goog-api-key":
-                              GEMINI_API_KEY
-                      },
-                      json=payload,
-                      timeout=180
-                  )
+                  try:
 
-                  # ------------------------------------------
-                  # RATE LIMIT
-                  # ------------------------------------------
-
-                  if r.status_code == 429:
-
-                      if attempt == max_attempts:
-                          raise Exception(
-                              "Gemini image generation "
-                              "rate limit persisted after "
-                              "multiple retries."
-                          )
-
-                      wait_time = 60 * attempt
-
-                      print(
-                          "Gemini image rate limit "
-                          f"reached. Waiting "
-                          f"{wait_time} seconds..."
+                      response = requests.post(
+                          endpoint,
+                          headers={
+                              "Content-Type":
+                                  "application/json",
+                              "x-goog-api-key":
+                                  GEMINI_API_KEY
+                          },
+                          json=payload,
+                          timeout=300
                       )
 
-                      time.sleep(wait_time)
+                      if response.status_code in (
+                          429,
+                          500,
+                          502,
+                          503,
+                          504
+                      ):
 
-                      continue
+                          if attempt == max_attempts:
+                              response.raise_for_status()
 
-                  # ------------------------------------------
-                  # OTHER SERVER ERRORS
-                  # ------------------------------------------
+                          wait_time = min(
+                              30 * (2 ** (attempt - 1)),
+                              300
+                          )
 
-                  if r.status_code >= 500:
+                          print(
+                              f"Gemini image API returned "
+                              f"{response.status_code}. "
+                              f"Waiting {wait_time} seconds..."
+                          )
 
-                      if attempt == max_attempts:
-                          r.raise_for_status()
+                          time.sleep(wait_time)
+                          continue
 
-                      wait_time = 30 * attempt
+                      response.raise_for_status()
+
+                      result = response.json()
+
+                      image_data = None
+
+                      for step in result.get(
+                          "steps",
+                          []
+                      ):
+
+                          if step.get(
+                              "type"
+                          ) == "model_output":
+
+                              for block in step.get(
+                                  "content",
+                                  []
+                              ):
+
+                                  if block.get(
+                                      "type"
+                                  ) == "image":
+
+                                      image_data = (
+                                          block.get("data")
+                                      )
+
+                      if not image_data:
+                          raise Exception(
+                              "Gemini did not return an image."
+                          )
+
+                      with open(
+                          output_file,
+                          "wb"
+                      ) as f:
+
+                          f.write(
+                              base64.b64decode(
+                                  image_data
+                              )
+                          )
 
                       print(
-                          "Gemini server error. "
+                          "IMAGE CREATED:",
+                          output_file
+                      )
+
+                      return
+
+                  except (
+                      requests.exceptions.Timeout,
+                      requests.exceptions.ConnectionError
+                  ) as error:
+
+                      if attempt == max_attempts:
+                          raise error
+
+                      wait_time = min(
+                          30 * (2 ** (attempt - 1)),
+                          300
+                      )
+
+                      print(
+                          "Image connection/timeout error. "
                           f"Waiting {wait_time} seconds..."
                       )
 
                       time.sleep(wait_time)
 
-                      continue
-
-                  # ------------------------------------------
-                  # NORMAL ERROR
-                  # ------------------------------------------
-
-                  r.raise_for_status()
-
-                  result = r.json()
-
-                  image_data = None
-
-                  for step in result.get(
-                      "steps",
-                      []
-                  ):
-
-                      if step.get(
-                          "type"
-                      ) == "model_output":
-
-                          for block in step.get(
-                              "content",
-                              []
-                          ):
-
-                              if block.get(
-                                  "type"
-                              ) == "image":
-
-                                  image_data = (
-                                      block.get("data")
-                                  )
-
-                  if not image_data:
-                      raise Exception(
-                          "Gemini did not return "
-                          "an image."
-                      )
-
-                  with open(
-                      output_file,
-                      "wb"
-                  ) as f:
-
-                      f.write(
-                          base64.b64decode(
-                              image_data
-                          )
-                      )
-
-                  print(
-                      "IMAGE CREATED:",
-                      output_file
-                  )
-
-                  return
+              raise Exception(
+                  "Image generation failed."
+              )
 
           # ==================================================
-          # 5. GENERATE HERO IMAGE
+          # 6. HERO IMAGE
           # ==================================================
 
           generate_image(
-
               f"""
           Create an original editorial illustration
           for a professional cryptocurrency news publication.
@@ -387,11 +449,9 @@ jobs:
 
           Create a modern cinematic crypto-market visual.
 
-          Include:
-          - abstract blockchain technology
-          - digital assets
-          - market charts
-          - financial data visualization
+          Include abstract blockchain technology,
+          digital assets, market charts and
+          financial data visualization.
 
           Do not use real people.
           Do not use celebrity likenesses.
@@ -400,20 +460,17 @@ jobs:
           Do not include unnecessary text.
 
           Professional financial-news style.
-
           Wide 16:9 composition.
           Suitable as a blog article hero image.
           """,
-
               image1_file
           )
 
           # ==================================================
-          # 6. GENERATE SECOND IMAGE
+          # 7. SECOND IMAGE
           # ==================================================
 
           generate_image(
-
               f"""
           Create a second original editorial image
           for this cryptocurrency article:
@@ -423,11 +480,9 @@ jobs:
           Show a sophisticated conceptual visualization
           of the main topic.
 
-          Combine:
-          - blockchain technology
-          - digital finance
-          - market trends
-          - investor analysis
+          Combine blockchain technology,
+          digital finance, market trends
+          and investor analysis.
 
           No real people.
           No celebrity likenesses.
@@ -437,15 +492,13 @@ jobs:
           Minimal or no text.
 
           Professional financial journalism aesthetic.
-
           Wide 16:9 composition.
           """,
-
               image2_file
           )
 
           # ==================================================
-          # 7. COMMIT IMAGES TO GITHUB
+          # 8. PUSH IMAGES TO GITHUB
           # ==================================================
 
           os.system(
@@ -473,12 +526,11 @@ jobs:
 
               if push_result != 0:
                   raise Exception(
-                      "Failed to push generated images "
-                      "to GitHub."
+                      "Failed to push images to GitHub."
                   )
 
           # ==================================================
-          # 8. GITHUB IMAGE URLs
+          # 9. IMAGE URLS
           # ==================================================
 
           repo_owner = "waqas4868"
@@ -498,7 +550,7 @@ jobs:
           )
 
           # ==================================================
-          # 9. INSERT IMAGES INTO ARTICLE
+          # 10. INSERT IMAGES
           # ==================================================
 
           hero_html = f"""
@@ -550,33 +602,21 @@ jobs:
               )
 
           # ==================================================
-          # 10. GET BLOGGER ACCESS TOKEN
+          # 11. BLOGGER TOKEN
           # ==================================================
 
           token_response = requests.post(
-
               "https://oauth2.googleapis.com/token",
-
               data={
                   "client_id":
-                      os.environ[
-                          "GOOGLE_CLIENT_ID"
-                      ],
-
+                      os.environ["GOOGLE_CLIENT_ID"],
                   "client_secret":
-                      os.environ[
-                          "GOOGLE_CLIENT_SECRET"
-                      ],
-
+                      os.environ["GOOGLE_CLIENT_SECRET"],
                   "refresh_token":
-                      os.environ[
-                          "GOOGLE_REFRESH_TOKEN"
-                      ],
-
+                      os.environ["GOOGLE_REFRESH_TOKEN"],
                   "grant_type":
                       "refresh_token"
               },
-
               timeout=60
           )
 
@@ -588,7 +628,7 @@ jobs:
           )
 
           # ==================================================
-          # 11. PUBLISH TO BLOGGER
+          # 12. PUBLISH TO BLOGGER
           # ==================================================
 
           blogger_url = (
@@ -605,23 +645,17 @@ jobs:
           }
 
           publish_response = requests.post(
-
               blogger_url,
-
               headers={
                   "Authorization":
                       f"Bearer {access_token}",
-
                   "Content-Type":
                       "application/json"
               },
-
               params={
                   "isDraft": "false"
               },
-
               json=post,
-
               timeout=120
           )
 
@@ -629,34 +663,17 @@ jobs:
 
           result = publish_response.json()
 
-          print(
-              "==================================="
-          )
-
+          print("===================================")
           print("SUCCESS")
           print("Title:", title)
           print(
               "Blogger URL:",
               result.get("url")
           )
-
-          print(
-              "Image 1:",
-              image1_url
-          )
-
-          print(
-              "Image 2:",
-              image2_url
-          )
-
-          print(
-              "Labels:",
-              labels
-          )
-
-          print(
-              "==================================="
-          )
+          print("Image 1:", image1_url)
+          print("Image 2:", image2_url)
+          print("Labels:", labels)
+          print("===================================")
 
           PY
+```0
