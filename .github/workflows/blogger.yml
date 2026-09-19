@@ -20,6 +20,7 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     env:
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
@@ -43,14 +44,13 @@ jobs:
         run: |
           pip install requests feedparser huggingface_hub pillow
 
-      - name: Generate and Publish
+      - name: Generate and Publish 4 Articles
         run: |
           python <<'PY'
           import os
           import re
           import json
           import time
-          import base64
           import html
           import subprocess
           from pathlib import Path
@@ -58,7 +58,6 @@ jobs:
           import requests
           import feedparser
           from huggingface_hub import InferenceClient
-
 
           # ============================================================
           # CONFIG
@@ -75,17 +74,79 @@ jobs:
           REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
 
           IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
-
           RSS_URL = "https://cointelegraph.com/rss"
 
+          ARTICLES_PER_RUN = 4
           IMAGE_DIR = Path("generated_images")
           IMAGE_DIR.mkdir(exist_ok=True)
 
+          STATE_FILE = Path("published_sources.json")
+
+          # ============================================================
+          # GIT CONFIG
+          # ============================================================
+
+          subprocess.run(
+              ["git", "config", "user.name", "CoinSignal Bot"],
+              check=True
+          )
+          subprocess.run(
+              [
+                  "git",
+                  "config",
+                  "user.email",
+                  "coinsignal-bot@users.noreply.github.com"
+              ],
+              check=True
+          )
+
+          # ============================================================
+          # DUPLICATE TRACKING
+          # ============================================================
+
+          if STATE_FILE.exists():
+              try:
+                  state = json.loads(
+                      STATE_FILE.read_text(encoding="utf-8")
+                  )
+              except Exception:
+                  state = []
+          else:
+              state = []
+
+          if not isinstance(state, list):
+              state = []
+
+          # This source was already published successfully by the old
+          # one-article workflow, so do not publish it again.
+          already_published_from_old_workflow = (
+              "https://cointelegraph.com/news/"
+              "hong-kong-jails-former-banker-over-16b-false-credit-"
+              "cryptocurrency-bribes-report"
+              "?utm_source=rss_feed&utm_medium=rss&utm_campaign="
+              "rss_partner_inbound"
+          )
+
+          if (
+              already_published_from_old_workflow
+              not in state
+          ):
+              state.append(
+                  already_published_from_old_workflow
+              )
+
+          published_sources = set(state)
+
+          print(
+              "Previously published sources:",
+              len(published_sources)
+          )
 
           # ============================================================
           # RSS
           # ============================================================
 
+          print("")
           print("Fetching crypto news...")
 
           feed = feedparser.parse(RSS_URL)
@@ -95,31 +156,46 @@ jobs:
 
           articles = []
 
-          for entry in feed.entries[:15]:
-              title = getattr(entry, "title", "")
-              link = getattr(entry, "link", "")
+          for entry in feed.entries[:30]:
+              title = getattr(entry, "title", "").strip()
+              link = getattr(entry, "link", "").strip()
 
-              if title and link:
-                  articles.append({
-                      "title": title,
-                      "link": link
-                  })
+              if not title or not link:
+                  continue
+
+              if link in published_sources:
+                  print("SKIPPING ALREADY PUBLISHED:", title)
+                  continue
+
+              articles.append({
+                  "title": title,
+                  "link": link
+              })
+
+              if len(articles) >= ARTICLES_PER_RUN:
+                  break
 
           if not articles:
-              raise Exception("No usable RSS articles found.")
+              raise Exception(
+                  "No new RSS articles available for this run."
+              )
 
-          selected = articles[0]
+          print("")
+          print(
+              f"Selected {len(articles)} new article(s) "
+              f"for this run."
+          )
 
-          print("SOURCE TITLE:", selected["title"])
-          print("SOURCE URL:", selected["link"])
-
+          for i, item in enumerate(articles, 1):
+              print(
+                  f"{i}. {item['title']}"
+              )
 
           # ============================================================
           # GEMINI JSON CLEANER
           # ============================================================
 
           def clean_json_text(text):
-
               text = text.strip()
 
               text = re.sub(
@@ -141,7 +217,6 @@ jobs:
               if start != -1 and end != -1:
                   text = text[start:end + 1]
 
-              # Remove invalid control characters
               text = "".join(
                   ch if ord(ch) >= 32 or ch in "\n\t\r" else " "
                   for ch in text
@@ -149,12 +224,11 @@ jobs:
 
               return text.strip()
 
-
           # ============================================================
           # GEMINI ARTICLE
           # ============================================================
 
-          def generate_article():
+          def generate_article(source):
 
               url = (
                   f"https://generativelanguage.googleapis.com/"
@@ -168,10 +242,10 @@ jobs:
           based on the following current news topic:
 
           SOURCE TITLE:
-          {selected["title"]}
+          {source["title"]}
 
           SOURCE URL:
-          {selected["link"]}
+          {source["link"]}
 
           Requirements:
 
@@ -182,7 +256,7 @@ jobs:
           - Attractive introduction.
           - Use H2 and H3 headings.
           - Explain important facts clearly.
-          - Include relevant Bitcoin/crypto context.
+          - Include relevant Bitcoin/crypto context where appropriate.
           - Avoid fake quotes.
           - Do not invent statistics.
           - Do not make unsupported claims.
@@ -197,7 +271,7 @@ jobs:
           {{
             "seo_title": "Article title",
             "html_content": "<p>...</p><h2>...</h2>...",
-            "labels": ["Bitcoin", "Crypto", "Blockchain", "Markets"]
+            "labels": ["Crypto News", "Crypto", "Blockchain", "Markets"]
           }}
           """
 
@@ -220,9 +294,7 @@ jobs:
               last_error = None
 
               for attempt in range(6):
-
                   try:
-
                       print(
                           f"ARTICLE ATTEMPT {attempt + 1}/6"
                       )
@@ -240,7 +312,6 @@ jobs:
                       if response.status_code in [
                           429, 500, 502, 503, 504
                       ]:
-
                           print(
                               f"Gemini returned {response.status_code}"
                           )
@@ -273,9 +344,7 @@ jobs:
                               cleaned,
                               strict=False
                           )
-
                       except json.JSONDecodeError:
-
                           cleaned = (
                               cleaned
                               .replace("\r", " ")
@@ -299,7 +368,6 @@ jobs:
                       return result
 
                   except Exception as e:
-
                       last_error = e
 
                       print(
@@ -323,14 +391,6 @@ jobs:
                   f"Article generation failed: {last_error}"
               )
 
-
-          article = generate_article()
-
-          print("")
-          print("ARTICLE TITLE:")
-          print(article["seo_title"])
-
-
           # ============================================================
           # HUGGING FACE IMAGE
           # ============================================================
@@ -349,9 +409,7 @@ jobs:
               last_error = None
 
               for attempt in range(12):
-
                   try:
-
                       print(
                           f"IMAGE ATTEMPT {attempt + 1}/12"
                       )
@@ -371,9 +429,7 @@ jobs:
                       return True
 
                   except Exception as e:
-
                       last_error = e
-
                       error_text = str(e)
 
                       print(
@@ -381,7 +437,6 @@ jobs:
                           error_text
                       )
 
-                      # Rate limit / temporary provider issue
                       if any(
                           code in error_text
                           for code in [
@@ -395,29 +450,24 @@ jobs:
                               "temporarily unavailable"
                           ]
                       ):
-
                           wait = min(
                               300 * (attempt + 1),
-                              1800
+                              900
                           )
 
                           print(
-                              f"Image service temporarily unavailable."
+                              "Image service temporarily unavailable."
                           )
-
                           print(
                               f"Waiting {wait} seconds before retry..."
                           )
 
                           time.sleep(wait)
-
                           continue
 
-                      # Other error
                       print(
                           "Non-retryable image error."
                       )
-
                       break
 
               print(
@@ -427,152 +477,8 @@ jobs:
 
               return False
 
-
-          safe_name = re.sub(
-              r"[^a-zA-Z0-9_-]+",
-              "-",
-              article["seo_title"].lower()
-          )[:80]
-
-          image_path = IMAGE_DIR / f"{safe_name}.png"
-
-          image_prompt = f"""
-          Create a professional editorial image for a cryptocurrency
-          news article.
-
-          Article headline:
-          {article["seo_title"]}
-
-          Style:
-          premium financial news photography,
-          modern cryptocurrency market atmosphere,
-          Bitcoin and blockchain visual elements,
-          realistic lighting,
-          sophisticated newsroom/editorial aesthetic,
-          cinematic composition,
-          high detail,
-          no text,
-          no logos,
-          no watermarks,
-          16:9 landscape composition.
-          """
-
-          image_ok = generate_image(
-              image_prompt,
-              image_path
-          )
-
-
           # ============================================================
-          # GIT COMMIT IMAGE
-          # ============================================================
-
-          image_url = None
-
-          if image_ok:
-
-              subprocess.run(
-                  ["git", "config", "user.name", "CoinSignal Bot"],
-                  check=True
-              )
-
-              subprocess.run(
-                  [
-                      "git",
-                      "config",
-                      "user.email",
-                      "coinsignal-bot@users.noreply.github.com"
-                  ],
-                  check=True
-              )
-
-              subprocess.run(
-                  ["git", "add", str(image_path)],
-                  check=True
-              )
-
-              commit = subprocess.run(
-                  [
-                      "git",
-                      "commit",
-                      "-m",
-                      f"Add image for {article['seo_title']}"
-                  ],
-                  capture_output=True,
-                  text=True
-              )
-
-              if commit.returncode == 0:
-
-                  subprocess.run(
-                      ["git", "push"],
-                      check=True
-                  )
-
-                  repo = os.environ.get(
-                      "GITHUB_REPOSITORY",
-                      "waqas4868/coinsignal-auto-blog"
-                  )
-
-                  image_url = (
-                      f"https://raw.githubusercontent.com/"
-                      f"{repo}/main/{image_path.as_posix()}"
-                  )
-
-                  print(
-                      "IMAGE URL:",
-                      image_url
-                  )
-
-              else:
-
-                  print(
-                      "No image commit needed or image already exists."
-                  )
-
-                  repo = os.environ.get(
-                      "GITHUB_REPOSITORY",
-                      "waqas4868/coinsignal-auto-blog"
-                  )
-
-                  image_url = (
-                      f"https://raw.githubusercontent.com/"
-                      f"{repo}/main/{image_path.as_posix()}"
-                  )
-
-
-          # ============================================================
-          # ADD IMAGE TO ARTICLE
-          # ============================================================
-
-          html_content = article["html_content"]
-
-          if image_url:
-
-              image_html = f"""
-          <p style="text-align:center;">
-          <img
-            src="{image_url}"
-            alt="{html.escape(article["seo_title"])}"
-            style="max-width:100%;height:auto;"
-          />
-          </p>
-          """
-
-              html_content = (
-                  image_html +
-                  html_content
-              )
-
-          else:
-
-              print(
-                  "Image unavailable. Publishing article without image."
-              )
-
-
-          # ============================================================
-          # GOOGLE OAUTH REFRESH
+          # GOOGLE OAUTH
           # ============================================================
 
           print("")
@@ -593,50 +499,335 @@ jobs:
 
           access_token = token_response.json()["access_token"]
 
-
           # ============================================================
-          # BLOGGER PUBLISH
+          # BLOGGER URL
           # ============================================================
-
-          print("Publishing to Blogger...")
 
           blogger_url = (
               f"https://www.googleapis.com/blogger/v3/blogs/"
               f"{BLOG_ID}/posts/"
           )
 
-          labels = article.get(
-              "labels",
-              ["Bitcoin", "Crypto", "Blockchain", "Markets"]
-          )
+          # ============================================================
+          # PROCESS 4 ARTICLES SEQUENTIALLY
+          # ============================================================
 
-          blogger_payload = {
-              "kind": "blogger#post",
-              "title": article["seo_title"],
-              "content": html_content,
-              "labels": labels
-          }
-
-          blogger_response = requests.post(
-              blogger_url,
-              headers={
-                  "Authorization": f"Bearer {access_token}",
-                  "Content-Type": "application/json"
-              },
-              json=blogger_payload,
-              timeout=120
-          )
-
-          blogger_response.raise_for_status()
-
-          published = blogger_response.json()
+          successful = 0
+          failed = 0
 
           print("")
           print("====================================")
-          print("SUCCESS")
+          print(f"STARTING BATCH: {len(articles)} ARTICLES")
           print("====================================")
-          print("TITLE:", article["seo_title"])
-          print("BLOGGER URL:", published.get("url"))
-          print("IMAGE:", "YES" if image_url else "NO")
+
+          for article_number, source in enumerate(
+              articles, 1
+          ):
+
+              print("")
+              print("####################################")
+              print(
+                  f"ARTICLE {article_number}/{len(articles)}"
+              )
+              print("SOURCE:", source["title"])
+              print("####################################")
+
+              try:
+
+                  # ----------------------------
+                  # Generate article
+                  # ----------------------------
+
+                  article = generate_article(source)
+
+                  print("")
+                  print(
+                      "ARTICLE TITLE:",
+                      article["seo_title"]
+                  )
+
+                  # ----------------------------
+                  # Generate image
+                  # ----------------------------
+
+                  safe_name = re.sub(
+                      r"[^a-zA-Z0-9_-]+",
+                      "-",
+                      article["seo_title"].lower()
+                  )[:80].strip("-")
+
+                  image_path = (
+                      IMAGE_DIR /
+                      f"{safe_name}.png"
+                  )
+
+                  image_prompt = f"""
+          Create a professional editorial image for a cryptocurrency
+          news article.
+
+          Article headline:
+          {article["seo_title"]}
+
+          Style:
+          premium financial news photography,
+          modern cryptocurrency market atmosphere,
+          Bitcoin and blockchain visual elements where relevant,
+          realistic lighting,
+          sophisticated newsroom/editorial aesthetic,
+          cinematic composition,
+          high detail,
+          no text,
+          no logos,
+          no watermarks,
+          16:9 landscape composition.
+          """
+
+                  image_ok = generate_image(
+                      image_prompt,
+                      image_path
+                  )
+
+                  # ----------------------------
+                  # GitHub image URL
+                  # ----------------------------
+
+                  image_url = None
+
+                  if image_ok:
+
+                      subprocess.run(
+                          ["git", "add", str(image_path)],
+                          check=True
+                      )
+
+                      commit = subprocess.run(
+                          [
+                              "git",
+                              "commit",
+                              "-m",
+                              (
+                                  "Add image for "
+                                  f"{article['seo_title']}"
+                              )
+                          ],
+                          capture_output=True,
+                          text=True
+                      )
+
+                      if commit.returncode == 0:
+                          subprocess.run(
+                              ["git", "push"],
+                              check=True
+                          )
+                      else:
+                          print(
+                              "Image commit returned no changes."
+                          )
+
+                      repo = os.environ.get(
+                          "GITHUB_REPOSITORY",
+                          "waqas4868/coinsignal-auto-blog"
+                      )
+
+                      image_url = (
+                          "https://raw.githubusercontent.com/"
+                          f"{repo}/main/"
+                          f"{image_path.as_posix()}"
+                      )
+
+                      print(
+                          "IMAGE URL:",
+                          image_url
+                      )
+
+                  # ----------------------------
+                  # Add image to article
+                  # ----------------------------
+
+                  html_content = article["html_content"]
+
+                  if image_url:
+
+                      image_html = f"""
+          <p style="text-align:center;">
+          <img
+            src="{image_url}"
+            alt="{html.escape(article["seo_title"])}"
+            style="max-width:100%;height:auto;"
+            loading="lazy"
+          />
+          </p>
+          """
+
+                      html_content = (
+                          image_html +
+                          html_content
+                      )
+
+                  else:
+                      print(
+                          "Image unavailable. "
+                          "Publishing article without image."
+                      )
+
+                  # ----------------------------
+                  # Blogger publish
+                  # ----------------------------
+
+                  print("Publishing to Blogger...")
+
+                  labels = article.get(
+                      "labels",
+                      [
+                          "Crypto News",
+                          "Crypto",
+                          "Blockchain",
+                          "Markets"
+                      ]
+                  )
+
+                  blogger_payload = {
+                      "kind": "blogger#post",
+                      "title": article["seo_title"],
+                      "content": html_content,
+                      "labels": labels
+                  }
+
+                  blogger_response = requests.post(
+                      blogger_url,
+                      headers={
+                          "Authorization":
+                              f"Bearer {access_token}",
+                          "Content-Type":
+                              "application/json"
+                      },
+                      json=blogger_payload,
+                      timeout=120
+                  )
+
+                  blogger_response.raise_for_status()
+
+                  published = blogger_response.json()
+
+                  print("")
+                  print("====================================")
+                  print("SUCCESS")
+                  print("====================================")
+                  print(
+                      "ARTICLE:",
+                      f"{article_number}/{len(articles)}"
+                  )
+                  print(
+                      "TITLE:",
+                      article["seo_title"]
+                  )
+                  print(
+                      "BLOGGER URL:",
+                      published.get("url")
+                  )
+                  print(
+                      "IMAGE:",
+                      "YES" if image_url else "NO"
+                  )
+                  print("====================================")
+
+                  # ----------------------------
+                  # Mark source as published
+                  # ----------------------------
+
+                  if source["link"] not in published_sources:
+                      published_sources.add(
+                          source["link"]
+                      )
+                      state.append(
+                          source["link"]
+                      )
+
+                      STATE_FILE.write_text(
+                          json.dumps(
+                              state,
+                              indent=2,
+                              ensure_ascii=False
+                          ),
+                          encoding="utf-8"
+                      )
+
+                      subprocess.run(
+                          ["git", "add", str(STATE_FILE)],
+                          check=True
+                      )
+
+                      state_commit = subprocess.run(
+                          [
+                              "git",
+                              "commit",
+                              "-m",
+                              (
+                                  "Track published source: "
+                                  f"{article['seo_title']}"
+                              )
+                          ],
+                          capture_output=True,
+                          text=True
+                      )
+
+                      if state_commit.returncode == 0:
+                          subprocess.run(
+                              ["git", "push"],
+                              check=True
+                          )
+
+                  successful += 1
+
+              except Exception as e:
+
+                  failed += 1
+
+                  print("")
+                  print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                  print(
+                      f"ARTICLE {article_number} FAILED"
+                  )
+                  print(
+                      "ERROR:",
+                      str(e)
+                  )
+                  print(
+                      "Continuing with next article..."
+                  )
+                  print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+                  continue
+
+          # ============================================================
+          # FINAL REPORT
+          # ============================================================
+
+          print("")
           print("====================================")
+          print("BATCH COMPLETE")
+          print("====================================")
+          print(
+              "REQUESTED:",
+              ARTICLES_PER_RUN
+          )
+          print(
+              "SELECTED:",
+              len(articles)
+          )
+          print(
+              "PUBLISHED:",
+              successful
+          )
+          print(
+              "FAILED:",
+              failed
+          )
+          print("====================================")
+
+          if successful == 0:
+              raise Exception(
+                  "No articles were published successfully."
+              )
+
           PY
