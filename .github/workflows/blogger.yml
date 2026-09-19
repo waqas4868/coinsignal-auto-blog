@@ -1,0 +1,211 @@
+name: CoinSignal Auto Blog
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+    - cron: "20 2 * * *"
+    - cron: "40 4 * * *"
+    - cron: "0 7 * * *"
+    - cron: "20 9 * * *"
+    - cron: "40 11 * * *"
+    - cron: "0 14 * * *"
+    - cron: "20 16 * * *"
+    - cron: "40 18 * * *"
+    - cron: "0 21 * * *"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pip install requests feedparser
+
+      - name: Generate and publish article
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+          BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        run: |
+          python <<'PY'
+          import os
+          import json
+          import requests
+          import feedparser
+          from datetime import datetime, timezone
+
+          GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+          GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+          BLOG_ID = os.environ["BLOGGER_BLOG_ID"]
+
+          # 1. Fetch live crypto news
+          feed = feedparser.parse("https://cointelegraph.com/rss")
+
+          if not feed.entries:
+              raise Exception("No crypto news items were found.")
+
+          entries = feed.entries[:10]
+
+          source_context = ""
+
+          for i, item in enumerate(entries, 1):
+              title = item.get("title", "")
+              url = item.get("link", "")
+              summary = item.get("summary", "")
+              published = item.get("published", "")
+
+              source_context += f"""
+          SOURCE {i}
+          Title: {title}
+          Date: {published}
+          URL: {url}
+          Summary: {summary}
+          """
+
+          # 2. Ask Gemini to select a current topic and write article
+          prompt = f"""
+          You are the senior crypto journalist for CoinSignal.
+
+          Use ONLY the supplied current news sources below for factual claims.
+
+          CURRENT DATE:
+          {datetime.now(timezone.utc).strftime("%Y-%m-%d")}
+
+          NEWS SOURCES:
+          {source_context}
+
+          TASK:
+
+          Select ONE genuinely current and useful cryptocurrency topic from
+          the supplied sources.
+
+          Write a 1200–1500 word publication-ready CoinSignal article.
+
+          Requirements:
+          - Create an SEO-friendly title.
+          - Use H2 and H3 headings.
+          - Use short mobile-friendly paragraphs.
+          - Base factual claims only on the supplied sources.
+          - Do not invent prices, statistics, quotes, regulations,
+            partnerships, events or market data.
+          - Clearly distinguish reported facts from analysis.
+          - Attribute reported information naturally.
+          - Do not make guaranteed-profit claims.
+          - Include relevant risks and uncertainty.
+          - End with a "Key Takeaways" section.
+          - End with a short cryptocurrency risk disclaimer.
+          - Return clean HTML only.
+          - Do NOT use Markdown.
+          - Do NOT include html/head/body tags.
+
+          Also provide exactly 5 relevant Blogger labels.
+
+          Return ONLY valid JSON in this format:
+
+          {{
+            "seo_title": "Article title",
+            "html_content": "<p>...</p>",
+            "labels": [
+              "Crypto",
+              "Bitcoin",
+              "Cryptocurrency News",
+              "Market Analysis",
+              "Blockchain"
+            ]
+          }}
+          """
+
+          endpoint = (
+              f"https://generativelanguage.googleapis.com/v1beta/"
+              f"models/{GEMINI_MODEL}:generateContent"
+              f"?key={GEMINI_API_KEY}"
+          )
+
+          response = requests.post(
+              endpoint,
+              headers={"Content-Type": "application/json"},
+              json={
+                  "contents": [
+                      {
+                          "parts": [
+                              {"text": prompt}
+                          ]
+                      }
+                  ],
+                  "generationConfig": {
+                      "temperature": 0.4,
+                      "responseMimeType": "application/json"
+                  }
+              },
+              timeout=120
+          )
+
+          response.raise_for_status()
+
+          data = response.json()
+
+          text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+          article = json.loads(text)
+
+          title = article["seo_title"]
+          content = article["html_content"]
+          labels = article.get("labels", [])
+
+          # 3. Get Blogger OAuth access token
+          token_response = requests.post(
+              "https://oauth2.googleapis.com/token",
+              data={
+                  "client_id": os.environ["GOOGLE_CLIENT_ID"],
+                  "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
+                  "refresh_token": os.environ["GOOGLE_REFRESH_TOKEN"],
+                  "grant_type": "refresh_token"
+              },
+              timeout=60
+          )
+
+          token_response.raise_for_status()
+
+          access_token = token_response.json()["access_token"]
+
+          # 4. Publish to Blogger
+          blogger_url = (
+              f"https://www.googleapis.com/blogger/v3/blogs/"
+              f"{BLOG_ID}/posts"
+          )
+
+          post = {
+              "kind": "blogger#post",
+              "title": title,
+              "content": content,
+              "labels": labels
+          }
+
+          publish_response = requests.post(
+              blogger_url,
+              headers={
+                  "Authorization": f"Bearer {access_token}",
+                  "Content-Type": "application/json"
+              },
+              params={"isDraft": "false"},
+              json=post,
+              timeout=120
+          )
+
+          publish_response.raise_for_status()
+
+          result = publish_response.json()
+
+          print("SUCCESS")
+          print("Title:", title)
+          print("Blogger URL:", result.get("url"))
+          print("Labels:", labels)
+          PY
