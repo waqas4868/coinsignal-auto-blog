@@ -37,6 +37,7 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+
         run: |
           python <<'PY'
           import os
@@ -45,30 +46,40 @@ jobs:
           import feedparser
           import base64
           import re
+          import time
           from datetime import datetime, timezone
 
           GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-          GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+          GEMINI_MODEL = os.environ.get(
+              "GEMINI_MODEL",
+              "gemini-3.6-flash"
+          )
+
           IMAGE_MODEL = "gemini-3.1-flash-image"
           BLOG_ID = os.environ["BLOGGER_BLOG_ID"]
 
           now = datetime.now(timezone.utc)
           stamp = now.strftime("%Y%m%d-%H%M%S")
 
-          # --------------------------------------------------
+          # ==================================================
           # 1. FETCH CURRENT CRYPTO NEWS
-          # --------------------------------------------------
+          # ==================================================
 
-          feed = feedparser.parse("https://cointelegraph.com/rss")
+          feed = feedparser.parse(
+              "https://cointelegraph.com/rss"
+          )
 
           if not feed.entries:
-              raise Exception("No crypto news items were found.")
+              raise Exception(
+                  "No crypto news items were found."
+              )
 
           entries = feed.entries[:10]
 
           source_context = ""
 
           for i, item in enumerate(entries, 1):
+
               title = item.get("title", "")
               url = item.get("link", "")
               summary = item.get("summary", "")
@@ -82,14 +93,15 @@ jobs:
           Summary: {summary}
           """
 
-          # --------------------------------------------------
+          # ==================================================
           # 2. GENERATE ARTICLE
-          # --------------------------------------------------
+          # ==================================================
 
           prompt = f"""
           You are the senior crypto journalist for CoinSignal.
 
-          Use ONLY the supplied current news sources below for factual claims.
+          Use ONLY the supplied current news sources below
+          for factual claims.
 
           CURRENT DATE:
           {now.strftime("%Y-%m-%d")}
@@ -99,18 +111,20 @@ jobs:
 
           TASK:
 
-          Select ONE genuinely current and useful cryptocurrency topic
-          from the supplied sources.
+          Select ONE genuinely current and useful
+          cryptocurrency topic from the supplied sources.
 
-          Write a 1200–1500 word publication-ready CoinSignal article.
+          Write a 1200–1500 word publication-ready
+          CoinSignal article.
 
           Requirements:
+
           - Create an SEO-friendly title.
           - Use H2 and H3 headings.
           - Use short mobile-friendly paragraphs.
           - Base factual claims only on the supplied sources.
-          - Do not invent prices, statistics, quotes, regulations,
-            partnerships, events or market data.
+          - Do not invent prices, statistics, quotes,
+            regulations, partnerships, events or market data.
           - Clearly distinguish reported facts from analysis.
           - Attribute reported information naturally.
           - Do not make guaranteed-profit claims.
@@ -137,19 +151,23 @@ jobs:
           """
 
           text_endpoint = (
-              f"https://generativelanguage.googleapis.com/v1beta/"
+              "https://generativelanguage.googleapis.com/v1beta/"
               f"models/{GEMINI_MODEL}:generateContent"
               f"?key={GEMINI_API_KEY}"
           )
 
           response = requests.post(
               text_endpoint,
-              headers={"Content-Type": "application/json"},
+              headers={
+                  "Content-Type": "application/json"
+              },
               json={
                   "contents": [
                       {
                           "parts": [
-                              {"text": prompt}
+                              {
+                                  "text": prompt
+                              }
                           ]
                       }
                   ],
@@ -164,7 +182,11 @@ jobs:
           response.raise_for_status()
 
           data = response.json()
-          text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+          text = (
+              data["candidates"][0]
+              ["content"]["parts"][0]["text"]
+          )
 
           article = json.loads(text)
 
@@ -174,27 +196,45 @@ jobs:
 
           print("ARTICLE TITLE:", title)
 
-          # --------------------------------------------------
+          # ==================================================
           # 3. CREATE IMAGE DIRECTORY
-          # --------------------------------------------------
+          # ==================================================
 
           image_dir = "generated-images"
-          os.makedirs(image_dir, exist_ok=True)
 
-          # Safe filename
-          safe_title = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower()).strip("-")
-          image1_file = f"{image_dir}/{safe_title}-{stamp}-1.png"
-          image2_file = f"{image_dir}/{safe_title}-{stamp}-2.png"
+          os.makedirs(
+              image_dir,
+              exist_ok=True
+          )
 
-          # --------------------------------------------------
-          # 4. GEMINI IMAGE GENERATION FUNCTION
-          # --------------------------------------------------
+          safe_title = re.sub(
+              r"[^a-zA-Z0-9]+",
+              "-",
+              title.lower()
+          ).strip("-")
 
-          def generate_image(prompt_text, output_file):
+          image1_file = (
+              f"{image_dir}/"
+              f"{safe_title}-{stamp}-1.png"
+          )
+
+          image2_file = (
+              f"{image_dir}/"
+              f"{safe_title}-{stamp}-2.png"
+          )
+
+          # ==================================================
+          # 4. GEMINI IMAGE GENERATION WITH RETRY
+          # ==================================================
+
+          def generate_image(
+              prompt_text,
+              output_file
+          ):
 
               image_endpoint = (
-                  "https://generativelanguage.googleapis.com/v1beta/"
-                  "interactions"
+                  "https://generativelanguage.googleapis.com/"
+                  "v1beta/interactions"
               )
 
               payload = {
@@ -207,182 +247,353 @@ jobs:
                   }
               }
 
-              r = requests.post(
-                  image_endpoint,
-                  headers={
-                      "Content-Type": "application/json",
-                      "x-goog-api-key": GEMINI_API_KEY
-                  },
-                  json=payload,
-                  timeout=180
-              )
+              max_attempts = 5
 
-              r.raise_for_status()
+              for attempt in range(
+                  1,
+                  max_attempts + 1
+              ):
 
-              result = r.json()
+                  print(
+                      f"IMAGE ATTEMPT "
+                      f"{attempt}/{max_attempts}"
+                  )
 
-              image_data = None
+                  r = requests.post(
+                      image_endpoint,
+                      headers={
+                          "Content-Type":
+                              "application/json",
+                          "x-goog-api-key":
+                              GEMINI_API_KEY
+                      },
+                      json=payload,
+                      timeout=180
+                  )
 
-              for step in result.get("steps", []):
-                  if step.get("type") == "model_output":
-                      for block in step.get("content", []):
-                          if block.get("type") == "image":
-                              image_data = block.get("data")
+                  # ------------------------------------------
+                  # RATE LIMIT
+                  # ------------------------------------------
 
-              if not image_data:
-                  raise Exception("Gemini did not return an image.")
+                  if r.status_code == 429:
 
-              with open(output_file, "wb") as f:
-                  f.write(base64.b64decode(image_data))
+                      if attempt == max_attempts:
+                          raise Exception(
+                              "Gemini image generation "
+                              "rate limit persisted after "
+                              "multiple retries."
+                          )
 
-              print("IMAGE CREATED:", output_file)
+                      wait_time = 60 * attempt
 
-          # --------------------------------------------------
-          # 5. GENERATE TWO ORIGINAL EDITORIAL IMAGES
-          # --------------------------------------------------
+                      print(
+                          "Gemini image rate limit "
+                          f"reached. Waiting "
+                          f"{wait_time} seconds..."
+                      )
+
+                      time.sleep(wait_time)
+
+                      continue
+
+                  # ------------------------------------------
+                  # OTHER SERVER ERRORS
+                  # ------------------------------------------
+
+                  if r.status_code >= 500:
+
+                      if attempt == max_attempts:
+                          r.raise_for_status()
+
+                      wait_time = 30 * attempt
+
+                      print(
+                          "Gemini server error. "
+                          f"Waiting {wait_time} seconds..."
+                      )
+
+                      time.sleep(wait_time)
+
+                      continue
+
+                  # ------------------------------------------
+                  # NORMAL ERROR
+                  # ------------------------------------------
+
+                  r.raise_for_status()
+
+                  result = r.json()
+
+                  image_data = None
+
+                  for step in result.get(
+                      "steps",
+                      []
+                  ):
+
+                      if step.get(
+                          "type"
+                      ) == "model_output":
+
+                          for block in step.get(
+                              "content",
+                              []
+                          ):
+
+                              if block.get(
+                                  "type"
+                              ) == "image":
+
+                                  image_data = (
+                                      block.get("data")
+                                  )
+
+                  if not image_data:
+                      raise Exception(
+                          "Gemini did not return "
+                          "an image."
+                      )
+
+                  with open(
+                      output_file,
+                      "wb"
+                  ) as f:
+
+                      f.write(
+                          base64.b64decode(
+                              image_data
+                          )
+                      )
+
+                  print(
+                      "IMAGE CREATED:",
+                      output_file
+                  )
+
+                  return
+
+          # ==================================================
+          # 5. GENERATE HERO IMAGE
+          # ==================================================
 
           generate_image(
+
               f"""
-              Create an original editorial illustration for a professional
-              cryptocurrency news publication.
+          Create an original editorial illustration
+          for a professional cryptocurrency news publication.
 
-              Article topic:
-              {title}
+          Article topic:
+          {title}
 
-              Create a modern cinematic crypto-market visual.
-              Include abstract blockchain technology, digital assets,
-              market charts and financial data visualization.
+          Create a modern cinematic crypto-market visual.
 
-              Do not use real people.
-              Do not use celebrity likenesses.
-              Do not copy logos or copyrighted artwork.
-              Do not include misleading exact prices.
-              Do not include unnecessary text.
+          Include:
+          - abstract blockchain technology
+          - digital assets
+          - market charts
+          - financial data visualization
 
-              Professional financial-news style.
-              Wide 16:9 composition.
-              Suitable as a blog article hero image.
-              """,
+          Do not use real people.
+          Do not use celebrity likenesses.
+          Do not copy logos or copyrighted artwork.
+          Do not include misleading exact prices.
+          Do not include unnecessary text.
+
+          Professional financial-news style.
+
+          Wide 16:9 composition.
+          Suitable as a blog article hero image.
+          """,
+
               image1_file
           )
 
+          # ==================================================
+          # 6. GENERATE SECOND IMAGE
+          # ==================================================
+
           generate_image(
+
               f"""
-              Create a second original editorial image for this cryptocurrency
-              article:
+          Create a second original editorial image
+          for this cryptocurrency article:
 
-              {title}
+          {title}
 
-              Show a sophisticated conceptual visualization of the main topic,
-              combining blockchain technology, digital finance, market trends
-              and investor analysis.
+          Show a sophisticated conceptual visualization
+          of the main topic.
 
-              No real people.
-              No celebrity likenesses.
-              No copied logos.
-              No copyrighted artwork.
-              Avoid fake exact statistics or prices.
-              Minimal or no text.
+          Combine:
+          - blockchain technology
+          - digital finance
+          - market trends
+          - investor analysis
 
-              Professional financial journalism aesthetic.
-              Wide 16:9 composition.
-              """,
+          No real people.
+          No celebrity likenesses.
+          No copied logos.
+          No copyrighted artwork.
+          Avoid fake exact statistics or prices.
+          Minimal or no text.
+
+          Professional financial journalism aesthetic.
+
+          Wide 16:9 composition.
+          """,
+
               image2_file
           )
 
-          # --------------------------------------------------
-          # 6. COMMIT GENERATED IMAGES TO THIS PUBLIC GITHUB REPOSITORY
-          # --------------------------------------------------
+          # ==================================================
+          # 7. COMMIT IMAGES TO GITHUB
+          # ==================================================
 
-          os.system("git config user.name 'CoinSignal Bot'")
-          os.system("git config user.email 'coinsignal-bot@users.noreply.github.com'")
+          os.system(
+              "git config user.name 'CoinSignal Bot'"
+          )
 
-          os.system("git add generated-images/")
+          os.system(
+              "git config user.email "
+              "'coinsignal-bot@users.noreply.github.com'"
+          )
+
+          os.system(
+              "git add generated-images/"
+          )
 
           commit_result = os.system(
-              f"git commit -m \"Add article images {stamp}\""
+              f'git commit -m "Add article images {stamp}"'
           )
 
           if commit_result == 0:
-              os.system("git push")
 
-          # Public raw GitHub URLs
+              push_result = os.system(
+                  "git push"
+              )
+
+              if push_result != 0:
+                  raise Exception(
+                      "Failed to push generated images "
+                      "to GitHub."
+                  )
+
+          # ==================================================
+          # 8. GITHUB IMAGE URLs
+          # ==================================================
+
           repo_owner = "waqas4868"
           repo_name = "coinsignal-auto-blog"
           branch = "main"
 
           image1_url = (
-              f"https://raw.githubusercontent.com/"
-              f"{repo_owner}/{repo_name}/{branch}/{image1_file}"
+              "https://raw.githubusercontent.com/"
+              f"{repo_owner}/{repo_name}/"
+              f"{branch}/{image1_file}"
           )
 
           image2_url = (
-              f"https://raw.githubusercontent.com/"
-              f"{repo_owner}/{repo_name}/{branch}/{image2_file}"
+              "https://raw.githubusercontent.com/"
+              f"{repo_owner}/{repo_name}/"
+              f"{branch}/{image2_file}"
           )
 
-          # --------------------------------------------------
-          # 7. INSERT IMAGES INTO ARTICLE
-          # --------------------------------------------------
+          # ==================================================
+          # 9. INSERT IMAGES INTO ARTICLE
+          # ==================================================
 
           hero_html = f"""
           <figure>
-            <img src="{image1_url}"
-                 alt="{title} cryptocurrency market illustration"
-                 style="width:100%;height:auto;border-radius:8px;">
+            <img
+              src="{image1_url}"
+              alt="{title} cryptocurrency market illustration"
+              style="width:100%;height:auto;border-radius:8px;">
             <figcaption>{title}</figcaption>
           </figure>
           """
 
           second_html = f"""
           <figure>
-            <img src="{image2_url}"
-                 alt="{title} blockchain and crypto market analysis illustration"
-                 style="width:100%;height:auto;border-radius:8px;">
-            <figcaption>Crypto market analysis and blockchain illustration</figcaption>
+            <img
+              src="{image2_url}"
+              alt="{title} blockchain and crypto market analysis illustration"
+              style="width:100%;height:auto;border-radius:8px;">
+            <figcaption>
+              Crypto market analysis and blockchain illustration
+            </figcaption>
           </figure>
           """
 
           paragraphs = content.split("</p>")
 
           if len(paragraphs) >= 4:
+
               content = (
                   paragraphs[0]
                   + "</p>"
                   + hero_html
-                  + "".join("</p>".join(paragraphs[1:3]))
+                  + "</p>".join(
+                      paragraphs[1:3]
+                  )
                   + "</p>"
                   + second_html
-                  + "".join("</p>".join(paragraphs[3:]))
+                  + "</p>".join(
+                      paragraphs[3:]
+                  )
               )
-          else:
-              content = hero_html + content + second_html
 
-          # --------------------------------------------------
-          # 8. GET BLOGGER ACCESS TOKEN
-          # --------------------------------------------------
+          else:
+
+              content = (
+                  hero_html
+                  + content
+                  + second_html
+              )
+
+          # ==================================================
+          # 10. GET BLOGGER ACCESS TOKEN
+          # ==================================================
 
           token_response = requests.post(
+
               "https://oauth2.googleapis.com/token",
+
               data={
-                  "client_id": os.environ["GOOGLE_CLIENT_ID"],
-                  "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
-                  "refresh_token": os.environ["GOOGLE_REFRESH_TOKEN"],
-                  "grant_type": "refresh_token"
+                  "client_id":
+                      os.environ[
+                          "GOOGLE_CLIENT_ID"
+                      ],
+
+                  "client_secret":
+                      os.environ[
+                          "GOOGLE_CLIENT_SECRET"
+                      ],
+
+                  "refresh_token":
+                      os.environ[
+                          "GOOGLE_REFRESH_TOKEN"
+                      ],
+
+                  "grant_type":
+                      "refresh_token"
               },
+
               timeout=60
           )
 
           token_response.raise_for_status()
 
-          access_token = token_response.json()["access_token"]
+          access_token = (
+              token_response.json()
+              ["access_token"]
+          )
 
-          # --------------------------------------------------
-          # 9. PUBLISH TO BLOGGER
-          # --------------------------------------------------
+          # ==================================================
+          # 11. PUBLISH TO BLOGGER
+          # ==================================================
 
           blogger_url = (
-              f"https://www.googleapis.com/blogger/v3/blogs/"
+              "https://www.googleapis.com/"
+              "blogger/v3/blogs/"
               f"{BLOG_ID}/posts"
           )
 
@@ -394,13 +605,23 @@ jobs:
           }
 
           publish_response = requests.post(
+
               blogger_url,
+
               headers={
-                  "Authorization": f"Bearer {access_token}",
-                  "Content-Type": "application/json"
+                  "Authorization":
+                      f"Bearer {access_token}",
+
+                  "Content-Type":
+                      "application/json"
               },
-              params={"isDraft": "false"},
+
+              params={
+                  "isDraft": "false"
+              },
+
               json=post,
+
               timeout=120
           )
 
@@ -408,12 +629,34 @@ jobs:
 
           result = publish_response.json()
 
-          print("===================================")
+          print(
+              "==================================="
+          )
+
           print("SUCCESS")
           print("Title:", title)
-          print("Blogger URL:", result.get("url"))
-          print("Image 1:", image1_url)
-          print("Image 2:", image2_url)
-          print("Labels:", labels)
-          print("===================================")
+          print(
+              "Blogger URL:",
+              result.get("url")
+          )
+
+          print(
+              "Image 1:",
+              image1_url
+          )
+
+          print(
+              "Image 2:",
+              image2_url
+          )
+
+          print(
+              "Labels:",
+              labels
+          )
+
+          print(
+              "==================================="
+          )
+
           PY
