@@ -14,6 +14,9 @@ on:
     - cron: "40 18 * * *"
     - cron: "0 21 * * *"
 
+permissions:
+  contents: write
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -26,7 +29,7 @@ jobs:
         run: |
           pip install requests feedparser
 
-      - name: Generate and publish article
+      - name: Generate article, images and publish
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
@@ -40,13 +43,22 @@ jobs:
           import json
           import requests
           import feedparser
+          import base64
+          import re
           from datetime import datetime, timezone
 
           GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
           GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+          IMAGE_MODEL = "gemini-3.1-flash-image"
           BLOG_ID = os.environ["BLOGGER_BLOG_ID"]
 
-          # 1. Fetch live crypto news
+          now = datetime.now(timezone.utc)
+          stamp = now.strftime("%Y%m%d-%H%M%S")
+
+          # --------------------------------------------------
+          # 1. FETCH CURRENT CRYPTO NEWS
+          # --------------------------------------------------
+
           feed = feedparser.parse("https://cointelegraph.com/rss")
 
           if not feed.entries:
@@ -70,22 +82,25 @@ jobs:
           Summary: {summary}
           """
 
-          # 2. Ask Gemini to select a current topic and write article
+          # --------------------------------------------------
+          # 2. GENERATE ARTICLE
+          # --------------------------------------------------
+
           prompt = f"""
           You are the senior crypto journalist for CoinSignal.
 
           Use ONLY the supplied current news sources below for factual claims.
 
           CURRENT DATE:
-          {datetime.now(timezone.utc).strftime("%Y-%m-%d")}
+          {now.strftime("%Y-%m-%d")}
 
           NEWS SOURCES:
           {source_context}
 
           TASK:
 
-          Select ONE genuinely current and useful cryptocurrency topic from
-          the supplied sources.
+          Select ONE genuinely current and useful cryptocurrency topic
+          from the supplied sources.
 
           Write a 1200–1500 word publication-ready CoinSignal article.
 
@@ -106,9 +121,7 @@ jobs:
           - Do NOT use Markdown.
           - Do NOT include html/head/body tags.
 
-          Also provide exactly 5 relevant Blogger labels.
-
-          Return ONLY valid JSON in this format:
+          Return ONLY valid JSON:
 
           {{
             "seo_title": "Article title",
@@ -123,14 +136,14 @@ jobs:
           }}
           """
 
-          endpoint = (
+          text_endpoint = (
               f"https://generativelanguage.googleapis.com/v1beta/"
               f"models/{GEMINI_MODEL}:generateContent"
               f"?key={GEMINI_API_KEY}"
           )
 
           response = requests.post(
-              endpoint,
+              text_endpoint,
               headers={"Content-Type": "application/json"},
               json={
                   "contents": [
@@ -151,7 +164,6 @@ jobs:
           response.raise_for_status()
 
           data = response.json()
-
           text = data["candidates"][0]["content"]["parts"][0]["text"]
 
           article = json.loads(text)
@@ -160,7 +172,196 @@ jobs:
           content = article["html_content"]
           labels = article.get("labels", [])
 
-          # 3. Get Blogger OAuth access token
+          print("ARTICLE TITLE:", title)
+
+          # --------------------------------------------------
+          # 3. CREATE IMAGE DIRECTORY
+          # --------------------------------------------------
+
+          image_dir = "generated-images"
+          os.makedirs(image_dir, exist_ok=True)
+
+          # Safe filename
+          safe_title = re.sub(r"[^a-zA-Z0-9]+", "-", title.lower()).strip("-")
+          image1_file = f"{image_dir}/{safe_title}-{stamp}-1.png"
+          image2_file = f"{image_dir}/{safe_title}-{stamp}-2.png"
+
+          # --------------------------------------------------
+          # 4. GEMINI IMAGE GENERATION FUNCTION
+          # --------------------------------------------------
+
+          def generate_image(prompt_text, output_file):
+
+              image_endpoint = (
+                  "https://generativelanguage.googleapis.com/v1beta/"
+                  "interactions"
+              )
+
+              payload = {
+                  "model": IMAGE_MODEL,
+                  "input": prompt_text,
+                  "response_format": {
+                      "type": "image",
+                      "aspect_ratio": "16:9",
+                      "image_size": "1K"
+                  }
+              }
+
+              r = requests.post(
+                  image_endpoint,
+                  headers={
+                      "Content-Type": "application/json",
+                      "x-goog-api-key": GEMINI_API_KEY
+                  },
+                  json=payload,
+                  timeout=180
+              )
+
+              r.raise_for_status()
+
+              result = r.json()
+
+              image_data = None
+
+              for step in result.get("steps", []):
+                  if step.get("type") == "model_output":
+                      for block in step.get("content", []):
+                          if block.get("type") == "image":
+                              image_data = block.get("data")
+
+              if not image_data:
+                  raise Exception("Gemini did not return an image.")
+
+              with open(output_file, "wb") as f:
+                  f.write(base64.b64decode(image_data))
+
+              print("IMAGE CREATED:", output_file)
+
+          # --------------------------------------------------
+          # 5. GENERATE TWO ORIGINAL EDITORIAL IMAGES
+          # --------------------------------------------------
+
+          generate_image(
+              f"""
+              Create an original editorial illustration for a professional
+              cryptocurrency news publication.
+
+              Article topic:
+              {title}
+
+              Create a modern cinematic crypto-market visual.
+              Include abstract blockchain technology, digital assets,
+              market charts and financial data visualization.
+
+              Do not use real people.
+              Do not use celebrity likenesses.
+              Do not copy logos or copyrighted artwork.
+              Do not include misleading exact prices.
+              Do not include unnecessary text.
+
+              Professional financial-news style.
+              Wide 16:9 composition.
+              Suitable as a blog article hero image.
+              """,
+              image1_file
+          )
+
+          generate_image(
+              f"""
+              Create a second original editorial image for this cryptocurrency
+              article:
+
+              {title}
+
+              Show a sophisticated conceptual visualization of the main topic,
+              combining blockchain technology, digital finance, market trends
+              and investor analysis.
+
+              No real people.
+              No celebrity likenesses.
+              No copied logos.
+              No copyrighted artwork.
+              Avoid fake exact statistics or prices.
+              Minimal or no text.
+
+              Professional financial journalism aesthetic.
+              Wide 16:9 composition.
+              """,
+              image2_file
+          )
+
+          # --------------------------------------------------
+          # 6. COMMIT GENERATED IMAGES TO THIS PUBLIC GITHUB REPOSITORY
+          # --------------------------------------------------
+
+          os.system("git config user.name 'CoinSignal Bot'")
+          os.system("git config user.email 'coinsignal-bot@users.noreply.github.com'")
+
+          os.system("git add generated-images/")
+
+          commit_result = os.system(
+              f"git commit -m \"Add article images {stamp}\""
+          )
+
+          if commit_result == 0:
+              os.system("git push")
+
+          # Public raw GitHub URLs
+          repo_owner = "waqas4868"
+          repo_name = "coinsignal-auto-blog"
+          branch = "main"
+
+          image1_url = (
+              f"https://raw.githubusercontent.com/"
+              f"{repo_owner}/{repo_name}/{branch}/{image1_file}"
+          )
+
+          image2_url = (
+              f"https://raw.githubusercontent.com/"
+              f"{repo_owner}/{repo_name}/{branch}/{image2_file}"
+          )
+
+          # --------------------------------------------------
+          # 7. INSERT IMAGES INTO ARTICLE
+          # --------------------------------------------------
+
+          hero_html = f"""
+          <figure>
+            <img src="{image1_url}"
+                 alt="{title} cryptocurrency market illustration"
+                 style="width:100%;height:auto;border-radius:8px;">
+            <figcaption>{title}</figcaption>
+          </figure>
+          """
+
+          second_html = f"""
+          <figure>
+            <img src="{image2_url}"
+                 alt="{title} blockchain and crypto market analysis illustration"
+                 style="width:100%;height:auto;border-radius:8px;">
+            <figcaption>Crypto market analysis and blockchain illustration</figcaption>
+          </figure>
+          """
+
+          paragraphs = content.split("</p>")
+
+          if len(paragraphs) >= 4:
+              content = (
+                  paragraphs[0]
+                  + "</p>"
+                  + hero_html
+                  + "".join("</p>".join(paragraphs[1:3]))
+                  + "</p>"
+                  + second_html
+                  + "".join("</p>".join(paragraphs[3:]))
+              )
+          else:
+              content = hero_html + content + second_html
+
+          # --------------------------------------------------
+          # 8. GET BLOGGER ACCESS TOKEN
+          # --------------------------------------------------
+
           token_response = requests.post(
               "https://oauth2.googleapis.com/token",
               data={
@@ -176,7 +377,10 @@ jobs:
 
           access_token = token_response.json()["access_token"]
 
-          # 4. Publish to Blogger
+          # --------------------------------------------------
+          # 9. PUBLISH TO BLOGGER
+          # --------------------------------------------------
+
           blogger_url = (
               f"https://www.googleapis.com/blogger/v3/blogs/"
               f"{BLOG_ID}/posts"
@@ -204,8 +408,12 @@ jobs:
 
           result = publish_response.json()
 
+          print("===================================")
           print("SUCCESS")
           print("Title:", title)
           print("Blogger URL:", result.get("url"))
+          print("Image 1:", image1_url)
+          print("Image 2:", image2_url)
           print("Labels:", labels)
+          print("===================================")
           PY
