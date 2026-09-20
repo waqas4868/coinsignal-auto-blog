@@ -748,14 +748,20 @@ jobs:
                   print("FACEBOOK: duplicate article; skipping."); return False
               if state["count"] >= FACEBOOK_DAILY_LIMIT:
                   print("FACEBOOK: daily limit 3 reached; pausing until next PKT day."); return False
-              if not image_url:
-                  print("FACEBOOK: no image URL; skipping."); return False
               short_detail = re.sub(r"<[^>]+>", " ", str(summary or ""))
               short_detail = re.sub(r"\s+", " ", short_detail).strip()
               if len(short_detail) > 420: short_detail = short_detail[:417].rsplit(" ", 1)[0] + "..."
-              message = f"{title}\n\n{short_detail}\n\nRead the full story on CoinSignal: {article_url}"
-              url = f"https://graph.facebook.com/{FACEBOOK_GRAPH_VERSION}/{FACEBOOK_PAGE_ID}/photos"
-              response = requests.post(url, data={"url": image_url, "caption": message, "access_token": FACEBOOK_PAGE_ACCESS_TOKEN}, timeout=120)
+              message = f"{title}\n\n{short_detail}"
+              url = f"https://graph.facebook.com/{FACEBOOK_GRAPH_VERSION}/{FACEBOOK_PAGE_ID}/feed"
+              response = requests.post(
+                  url,
+                  data={
+                      "message": message,
+                      "link": article_url,
+                      "access_token": FACEBOOK_PAGE_ACCESS_TOKEN
+                  },
+                  timeout=120
+              )
               if not response.ok:
                   print("FACEBOOK PUBLISH FAILED:", response.status_code); print("FACEBOOK RESPONSE:", response.text[:2000]); return False
               data = response.json(); state["count"] += 1; state["urls"].append(article_url); save_facebook_state(state)
