@@ -24,7 +24,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # Final platform/job ceiling; individual retry loops remain bounded.
+    timeout-minutes: 360  # Hard runner ceiling; hard quota/auth errors stop retries earlier.
 
     env:
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
@@ -98,6 +98,7 @@ jobs:
           # platform-level upper bound.
           MAX_RETRY_ATTEMPTS = 500
           GEMINI_MIN_GAP_SECONDS = 20
+          MAX_RETRY_WAIT_SECONDS = 60
           
           # ============================================================
           # GIT CONFIG
@@ -285,26 +286,87 @@ jobs:
           # ============================================================
           
           RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
-          
-          
+
+
+          class QuotaExhaustedError(RuntimeError):
+              """Hard quota exhaustion: stop this run until the quota resets."""
+
+
+          def _response_body_text(response):
+              try:
+                  return response.text[:5000].lower()
+              except Exception:
+                  return ""
+
+
+          def is_hard_quota_exhausted(response=None, error_text=""):
+              """Detect hard daily/monthly/project quota exhaustion, not normal rate limiting."""
+              body = _response_body_text(response) if response is not None else ""
+              text = f"{body} {str(error_text or '').lower()}"
+              hard_markers = [
+                  "quota exceeded for metric",
+                  "dailylimitexceeded",
+                  "daily_limit_exceeded",
+                  "perdayperproject",
+                  "perdaypermodel",
+                  "perday",
+                  "permonth",
+                  "daily quota",
+                  "monthly quota",
+                  "quotavalue",
+              ]
+              return (
+                  any(marker in text for marker in hard_markers)
+                  and any(
+                      marker in text
+                      for marker in [
+                          "exceeded your current quota",
+                          "quota exceeded",
+                          "quota is exhausted",
+                          "limit exceeded",
+                      ]
+                  )
+              )
+
+
+          def retry_after_from_response(response):
+              """Read Retry-After header or Google-style RetryInfo retryDelay."""
+              if response is None:
+                  return None
+
+              header = response.headers.get("Retry-After")
+              if header:
+                  try:
+                      return max(float(header), 1.0)
+                  except Exception:
+                      pass
+
+              try:
+                  payload = response.json()
+                  details = payload.get("error", {}).get("details", [])
+                  for detail in details:
+                      if str(detail.get("@type", "")).endswith("RetryInfo"):
+                          raw = str(detail.get("retryDelay", ""))
+                          if raw.endswith("s"):
+                              return max(float(raw[:-1]), 1.0)
+              except Exception:
+                  pass
+              return None
+
+
           def retry_wait(response=None, attempt=1):
-              """Return a bounded retry delay. Honor Retry-After, but cap it."""
-              if response is not None:
-                  retry_after = response.headers.get("Retry-After")
-                  if retry_after:
-                      try:
-                          return min(max(int(float(retry_after)), 5), 120)
-                      except Exception:
-                          pass
-          
-              steps = [5, 10, 20, 30, 45, 60]
+              """Return a bounded retry delay and honor server retry hints."""
+              server_wait = retry_after_from_response(response)
+              if server_wait is not None:
+                  return min(max(int(server_wait), 5), MAX_RETRY_WAIT_SECONDS)
+              steps = [5, 10, 15, 20, 30, MAX_RETRY_WAIT_SECONDS]
               return steps[min(max(attempt - 1, 0), len(steps) - 1)]
-          
-          
+
+
           def is_retryable_http(status_code):
               return status_code in RETRYABLE_HTTP_STATUSES
-          
-          
+
+
           def clean_json_text(text):
               text = text.strip()
               text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
@@ -461,6 +523,13 @@ jobs:
                               f"Gemini HTTP {response.status_code}: {response.text[:1500]}"
                           )
                           print("Gemini API response:", response.text[:1500])
+
+                      if is_hard_quota_exhausted(response=response):
+                          raise QuotaExhaustedError(
+                              "GEMINI_QUOTA_EXHAUSTED: Gemini daily/monthly/project quota is exhausted. "
+                              "Stopping this run so the workflow does not waste 500 retries. "
+                              "The next scheduled run can try again after quota reset or a plan/quota change."
+                          )
           
                           if not is_retryable_http(response.status_code):
                               raise last_error
@@ -566,6 +635,12 @@ jobs:
                       last_error = e
                       error_text = str(e).lower()
                       print("IMAGE ERROR:", str(e))
+
+                      if is_hard_quota_exhausted(error_text=error_text):
+                          raise QuotaExhaustedError(
+                              "IMAGE_QUOTA_EXHAUSTED: Image provider reports a hard quota/credit limit. "
+                              "Stopping this run instead of burning through 500 retries."
+                          )
           
                       permanent_markers = [
                           "401", "403", "unauthorized", "forbidden",
@@ -623,6 +698,11 @@ jobs:
                           return data["access_token"]
           
                       body = response.text[:1000]
+                      if is_hard_quota_exhausted(response=response):
+                          raise QuotaExhaustedError(
+                              "GOOGLE_QUOTA_EXHAUSTED: Google token endpoint reports a hard quota limit. "
+                              "Stopping this run."
+                          )
                       last_error = RuntimeError(
                           f"Google OAuth refresh failed HTTP {response.status_code}: {body}"
                       )
@@ -690,6 +770,12 @@ jobs:
                   )
           
               if not response.ok:
+                  if is_hard_quota_exhausted(response=response):
+                      raise QuotaExhaustedError(
+                          "BLOGGER_QUOTA_EXHAUSTED: Blogger/Google reports a hard quota limit. "
+                          "Stopping this run instead of repeatedly retrying."
+                      )
+
                   if is_retryable_http(response.status_code):
                       raise RuntimeError(
                           f"BLOGGER_VALIDATION_RETRYABLE_{response.status_code}: {response.text[:1000]}"
@@ -954,6 +1040,12 @@ jobs:
                       print("FACEBOOK PUBLISH FAILED:", response.status_code)
                       print("FACEBOOK RESPONSE:", response.text[:2000])
           
+                      if is_hard_quota_exhausted(response=response):
+                          raise QuotaExhaustedError(
+                              "FACEBOOK_QUOTA_EXHAUSTED: Facebook reports a hard quota limit. "
+                              "Stopping this run instead of repeatedly retrying."
+                          )
+
                       # Permission/configuration errors will not become valid by retrying.
                       if not is_retryable_http(response.status_code):
                           raise last_error
@@ -1199,6 +1291,12 @@ jobs:
                                   f"{blogger_response.text[:1500]}"
                               )
           
+                              if is_hard_quota_exhausted(response=blogger_response):
+                                  raise QuotaExhaustedError(
+                                      "BLOGGER_QUOTA_EXHAUSTED: Blogger reports a hard quota limit. "
+                                      "Stopping this run."
+                                  )
+
                               if blogger_response.status_code == 401:
                                   print("Blogger 401: refreshing Google OAuth token before retry.")
                                   access_token = refresh_google_access_token()
@@ -1354,6 +1452,17 @@ jobs:
           
                   successful += 1
           
+              except QuotaExhaustedError as e:
+                  print("")
+                  print("====================================")
+                  print("RUN PAUSED — HARD QUOTA EXHAUSTED")
+                  print("====================================")
+                  print("ERROR:", str(e))
+                  print("No 500-attempt retry loop will continue for this run.")
+                  print("The next scheduled run may try again after the quota resets.")
+                  print("====================================")
+                  raise SystemExit(0)
+
               except Exception as e:
                   failed += 1
           
