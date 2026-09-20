@@ -22,7 +22,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360  # GitHub-hosted runner maximum; retry loops persist within this window.
 
     env:
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
@@ -90,9 +90,18 @@ jobs:
           IMAGE_DIR.mkdir(exist_ok=True)
           STATE_FILE = Path("published_sources.json")
 
-          GEMINI_MAX_ATTEMPTS = 4
+          # Retry transient Gemini/service failures continuously until the
+          # article is generated successfully. GitHub-hosted jobs have a
+          # maximum execution window, so the runner itself can still stop
+          # after that platform limit.
+          # Resilience policy: retry transient/service failures up to 500 attempts.
+          # The GitHub-hosted runner itself is limited to 360 minutes, so this
+          # protects against temporary outages without pretending the platform
+          # can run forever.
+          MAX_RETRY_ATTEMPTS = 500
+          GEMINI_RETRY_FOREVER = True
           GEMINI_MIN_GAP_SECONDS = 45
-          BLOGGER_REAUTH_ATTEMPTS = 2
+          BLOGGER_REAUTH_ATTEMPTS = MAX_RETRY_ATTEMPTS
 
           # ============================================================
           # GIT CONFIG
@@ -211,10 +220,21 @@ jobs:
           print("")
           print("Fetching crypto news...")
 
-          feed = feedparser.parse(RSS_URL)
+          feed = None
+          for rss_attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+              try:
+                  feed = feedparser.parse(RSS_URL)
+                  if feed.entries:
+                      break
+                  print(f"RSS returned no entries on attempt {rss_attempt}/{MAX_RETRY_ATTEMPTS}.")
+              except Exception as e:
+                  print("RSS ERROR:", str(e))
+              wait = min(30 * (2 ** min(rss_attempt - 1, 5)), 300)
+              print(f"Waiting {wait}s before RSS retry {rss_attempt + 1}/{MAX_RETRY_ATTEMPTS}...")
+              time.sleep(wait)
 
-          if not feed.entries:
-              raise Exception("No RSS articles found.")
+          if feed is None or not feed.entries:
+              raise Exception(f"No RSS articles found after {MAX_RETRY_ATTEMPTS} attempts.")
 
           articles = []
 
@@ -255,7 +275,8 @@ jobs:
                   break
 
           if not articles:
-              raise Exception("No new RSS articles available for this run.")
+              print("No new RSS articles available for this run. Nothing to publish; exiting successfully.")
+              raise SystemExit(0)
 
           print("")
           print(f"Selected {len(articles)} new article(s) for this run.")
@@ -435,12 +456,12 @@ jobs:
                   }
               }
 
-              last_error = None
+              attempt = 0
+              while True:
+                  attempt += 1
+                  print(f"ARTICLE ATTEMPT {attempt} (automatic retry until success)")
 
-              for attempt in range(GEMINI_MAX_ATTEMPTS):
                   try:
-                      print(f"ARTICLE ATTEMPT {attempt + 1}/{GEMINI_MAX_ATTEMPTS}")
-
                       response = requests.post(
                           url,
                           headers={
@@ -452,39 +473,36 @@ jobs:
                       )
 
                       if response.status_code in [429, 500, 502, 503, 504]:
-                          print(
-                              "Gemini API response:",
-                              response.text[:1500]
-                          )
-
-                          wait = retry_wait_from_response(response, attempt)
-
+                          print("Gemini API response:", response.text[:1500])
+                          wait = retry_wait_from_response(response, attempt - 1)
                           print(
                               f"Gemini returned HTTP {response.status_code}; "
-                              f"waiting {wait} seconds before retry "
-                              f"{attempt + 2}/{GEMINI_MAX_ATTEMPTS}."
+                              f"waiting {wait} seconds before automatic retry."
                           )
-
-                          if attempt == GEMINI_MAX_ATTEMPTS - 1:
-                              response.raise_for_status()
-
                           time.sleep(wait)
                           continue
 
                       if not response.ok:
+                          # User-requested resilience policy: do not abandon the
+                          # article because of an unexpected API status. Retry
+                          # all HTTP failures within the runner window.
                           print(
-                              "Gemini non-retryable response:",
-                              response.text[:1500]
+                              f"Gemini HTTP {response.status_code}; treating as "
+                              "retryable and continuing automatically."
                           )
-
-                      response.raise_for_status()
+                          print("Gemini API response:", response.text[:1500])
+                          wait = min(30 * (2 ** min(attempt - 1, 5)), 600)
+                          print(
+                              f"Waiting {wait} seconds before automatic retry "
+                              f"{attempt + 1}/{MAX_RETRY_ATTEMPTS}."
+                          )
+                          time.sleep(wait)
+                          continue
 
                       data = response.json()
 
                       if not data.get("candidates"):
-                          raise Exception(
-                              "Gemini returned no candidates."
-                          )
+                          raise ValueError("Gemini returned no candidates.")
 
                       text = (
                           data["candidates"][0]
@@ -510,17 +528,12 @@ jobs:
                           "meta_description"
                       ]
 
-                      missing = [
-                          key for key in required if key not in result
-                      ]
-
+                      missing = [key for key in required if key not in result]
                       if missing:
-                          raise Exception(
-                              "Gemini JSON missing fields: "
-                              + ", ".join(missing)
+                          raise ValueError(
+                              "Gemini JSON missing fields: " + ", ".join(missing)
                           )
 
-                      # Prevent accidental Markdown/code fences in Blogger.
                       result["html_content"] = re.sub(
                           r"```(?:html)?|```",
                           "",
@@ -528,20 +541,24 @@ jobs:
                           flags=re.IGNORECASE
                       ).strip()
 
+                      print(f"Gemini article generation SUCCESS on attempt {attempt}.")
                       return result
 
-                  except Exception as e:
-                      last_error = e
-                      print("ARTICLE ERROR:", str(e))
+                  except requests.RequestException as e:
+                      print("Gemini network/request error:", str(e))
+                      wait = min(30 * (2 ** min(attempt - 1, 5)), 600)
+                      print(f"Waiting {wait} seconds before automatic retry.")
+                      time.sleep(wait)
+                      continue
 
-                      if attempt < GEMINI_MAX_ATTEMPTS - 1:
-                          time.sleep(
-                              min(45 * (attempt + 1), 240)
-                          )
-
-              raise Exception(
-                  f"Article generation failed after retries: {last_error}"
-              )
+                  except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
+                      # Malformed/empty model output is treated as transient so
+                      # the article is retried automatically instead of being lost.
+                      print("Gemini output error:", str(e))
+                      wait = min(30 * (2 ** min(attempt - 1, 5)), 600)
+                      print(f"Waiting {wait} seconds before automatic retry.")
+                      time.sleep(wait)
+                      continue
 
           # ============================================================
           # HUGGING FACE IMAGE
@@ -552,51 +569,28 @@ jobs:
               print("Starting Hugging Face image generation...")
               print("Model:", IMAGE_MODEL)
 
-              client = InferenceClient(
-                  provider="auto",
-                  api_key=HF_TOKEN
-              )
-
+              client = InferenceClient(provider="auto", api_key=HF_TOKEN)
               last_error = None
 
-              for attempt in range(12):
+              for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
                   try:
-                      print(f"IMAGE ATTEMPT {attempt + 1}/12")
-
-                      image = client.text_to_image(
-                          prompt=prompt,
-                          model=IMAGE_MODEL
-                      )
-
+                      print(f"IMAGE ATTEMPT {attempt}/{MAX_RETRY_ATTEMPTS}")
+                      image = client.text_to_image(prompt=prompt, model=IMAGE_MODEL)
                       image.save(output_file)
-
                       print("IMAGE GENERATED:", output_file)
                       return True
-
                   except Exception as e:
                       last_error = e
                       error_text = str(e)
-
                       print("IMAGE ERROR:", error_text)
+                      wait = min(30 * (2 ** min(attempt - 1, 5)), 600)
+                      print(f"Waiting {wait} seconds before retry {attempt + 1}/{MAX_RETRY_ATTEMPTS}...")
+                      time.sleep(wait)
 
-                      if any(
-                          code in error_text
-                          for code in [
-                              "429", "500", "502", "503", "504",
-                              "Too Many Requests",
-                              "rate limit",
-                              "temporarily unavailable"
-                          ]
-                      ):
-                          wait = min(300 * (attempt + 1), 900)
-                          print(f"Waiting {wait} seconds before retry...")
-                          time.sleep(wait)
-                          continue
+              raise RuntimeError(
+                  f"Image generation did not succeed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}"
+              )
 
-                      break
-
-              print("IMAGE GENERATION FAILED:", last_error)
-              return False
 
           # ============================================================
           # GOOGLE OAUTH / BLOGGER AUTH
@@ -742,30 +736,67 @@ jobs:
 
           def publish_to_facebook(title, summary, article_url, image_url):
               if not FACEBOOK_PAGE_ID or not FACEBOOK_PAGE_ACCESS_TOKEN:
-                  print("FACEBOOK: skipped; secrets are not configured."); return False
-              state = load_facebook_state(); normalized = normalize_url(article_url)
+                  raise RuntimeError("FACEBOOK_CONFIGURATION_ERROR: Page ID or Page Access Token is missing.")
+
+              state = load_facebook_state()
+              normalized = normalize_url(article_url)
+
               if normalized in {normalize_url(x) for x in state["urls"]}:
-                  print("FACEBOOK: duplicate article; skipping."); return False
+                  print("FACEBOOK: duplicate article; skipping.")
+                  return False
+
               if state["count"] >= FACEBOOK_DAILY_LIMIT:
-                  print("FACEBOOK: daily limit 3 reached; pausing until next PKT day."); return False
+                  print("FACEBOOK: daily limit 3 reached; pausing until next PKT day.")
+                  return False
+
               short_detail = re.sub(r"<[^>]+>", " ", str(summary or ""))
               short_detail = re.sub(r"\s+", " ", short_detail).strip()
-              if len(short_detail) > 420: short_detail = short_detail[:417].rsplit(" ", 1)[0] + "..."
+              if len(short_detail) > 420:
+                  short_detail = short_detail[:417].rsplit(" ", 1)[0] + "..."
+
               message = f"{title}\n\n{short_detail}"
               url = f"https://graph.facebook.com/{FACEBOOK_GRAPH_VERSION}/{FACEBOOK_PAGE_ID}/feed"
-              response = requests.post(
-                  url,
-                  data={
-                      "message": message,
-                      "link": article_url,
-                      "access_token": FACEBOOK_PAGE_ACCESS_TOKEN
-                  },
-                  timeout=120
+
+              last_error = None
+              for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                  try:
+                      response = requests.post(
+                          url,
+                          data={
+                              "message": message,
+                              "link": article_url,
+                              "access_token": FACEBOOK_PAGE_ACCESS_TOKEN
+                          },
+                          timeout=120
+                      )
+
+                      if response.ok:
+                          data = response.json()
+                          state["count"] += 1
+                          state["urls"].append(article_url)
+                          save_facebook_state(state)
+                          print("FACEBOOK PAGE PUBLISHED:", data.get("id", "OK"))
+                          print(f"FACEBOOK DAILY COUNT: {state['count']}/{FACEBOOK_DAILY_LIMIT}")
+                          return True
+
+                      last_error = RuntimeError(
+                          f"HTTP {response.status_code}: {response.text[:2000]}"
+                      )
+                      print("FACEBOOK PUBLISH FAILED:", response.status_code)
+                      print("FACEBOOK RESPONSE:", response.text[:2000])
+
+                  except requests.RequestException as e:
+                      last_error = e
+                      print("FACEBOOK NETWORK ERROR:", str(e))
+
+                  wait = min(30 * (2 ** min(attempt - 1, 5)), 600)
+                  print(f"FACEBOOK: waiting {wait}s before retry {attempt + 1}/{MAX_RETRY_ATTEMPTS}...")
+                  time.sleep(wait)
+
+              raise RuntimeError(
+                  f"Facebook publishing did not succeed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}"
               )
-              if not response.ok:
-                  print("FACEBOOK PUBLISH FAILED:", response.status_code); print("FACEBOOK RESPONSE:", response.text[:2000]); return False
-              data = response.json(); state["count"] += 1; state["urls"].append(article_url); save_facebook_state(state)
-              print("FACEBOOK PAGE PUBLISHED:", data.get("id", "OK")); print(f"FACEBOOK DAILY COUNT: {state['count']}/{FACEBOOK_DAILY_LIMIT}"); return True
+
 
           successful = 0
           failed = 0
@@ -948,44 +979,52 @@ jobs:
 
                   print("Publishing to Blogger...")
 
-                  # Retry once after a fresh OAuth token if Blogger returns 401.
+                  # Keep retrying Blogger publish until it succeeds or the
+                  # GitHub runner reaches its platform execution limit.
                   blogger_response = None
+                  last_blogger_error = None
 
-                  for publish_attempt in range(2):
-                      blogger_response = requests.post(
-                          blogger_url,
-                          headers=blogger_headers(access_token),
-                          json=blogger_payload,
-                          timeout=120
-                      )
+                  for publish_attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                      try:
+                          blogger_response = requests.post(
+                              blogger_url,
+                              headers=blogger_headers(access_token),
+                              json=blogger_payload,
+                              timeout=120
+                          )
 
-                      if blogger_response.status_code != 401:
-                          break
+                          if blogger_response.ok:
+                              break
 
+                          print(
+                              f"BLOGGER PUBLISH FAILED HTTP {blogger_response.status_code}: "
+                              f"{blogger_response.text[:1500]}"
+                          )
+
+                          if blogger_response.status_code == 401:
+                              print("Blogger 401: refreshing Google OAuth token before retry.")
+                              access_token = refresh_google_access_token()
+                              validate_blogger_access(access_token)
+
+                          last_blogger_error = RuntimeError(
+                              f"HTTP {blogger_response.status_code}: {blogger_response.text[:1500]}"
+                          )
+
+                      except requests.RequestException as e:
+                          last_blogger_error = e
+                          print("BLOGGER NETWORK ERROR:", str(e))
+
+                      wait = min(30 * (2 ** min(publish_attempt - 1, 5)), 600)
                       print(
-                          "Blogger returned 401. Refreshing Google OAuth "
-                          "token and retrying once..."
+                          f"BLOGGER: waiting {wait}s before retry "
+                          f"{publish_attempt + 1}/{MAX_RETRY_ATTEMPTS}..."
                       )
-                      access_token = refresh_google_access_token()
-                      validate_blogger_access(access_token)
+                      time.sleep(wait)
 
-                  if blogger_response.status_code == 401:
+                  if blogger_response is None or not blogger_response.ok:
                       raise RuntimeError(
-                          "BLOGGER_AUTH_401_AFTER_REFRESH: Blogger still "
-                          "rejected the refreshed token. The GitHub "
-                          "GOOGLE_REFRESH_TOKEN must be regenerated using "
-                          "the Blogger write scope and the Google OAuth app "
-                          "should be moved to Production rather than Testing."
+                          f"Blogger publishing did not succeed after {MAX_RETRY_ATTEMPTS} attempts: {last_blogger_error}"
                       )
-
-                  if blogger_response.status_code == 403:
-                      raise RuntimeError(
-                          "BLOGGER_AUTH_403_ON_PUBLISH: Token is valid but "
-                          "the authorized Google account cannot publish to "
-                          "this blog. Check Blogger author/admin permissions."
-                      )
-
-                  blogger_response.raise_for_status()
 
                   published = blogger_response.json()
 
@@ -1091,8 +1130,9 @@ jobs:
 
           if successful == 0:
               raise Exception(
-                  "No articles were published successfully. "
-                  "Review the Gemini/Blogger error messages above."
+                  "No articles were published successfully. The workflow exhausted its "
+                  "retry window or encountered a configuration/non-retryable error. "
+                  "Review the service logs above."
               )
 
           PY
