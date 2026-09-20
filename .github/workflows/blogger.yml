@@ -3,19 +3,21 @@ name: CoinSignal Auto Blog
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
-    - cron: "20 2 * * *"
-    - cron: "40 4 * * *"
-    - cron: "0 7 * * *"
-    - cron: "20 9 * * *"
-    - cron: "40 11 * * *"
-    - cron: "0 14 * * *"
-    - cron: "20 16 * * *"
-    - cron: "40 18 * * *"
-    - cron: "0 21 * * *"
+    # 6 runs/day = 02:00, 06:00, 10:00, 14:00, 18:00, 22:00 PKT
+    # GitHub Actions cron is UTC (PKT = UTC+5).
+    - cron: "0 21 * * *"  # 02:00 PKT
+    - cron: "0 1 * * *"   # 06:00 PKT
+    - cron: "0 5 * * *"   # 10:00 PKT
+    - cron: "0 9 * * *"   # 14:00 PKT
+    - cron: "0 13 * * *"  # 18:00 PKT
+    - cron: "0 17 * * *"  # 22:00 PKT
 
 permissions:
   contents: write
+
+concurrency:
+  group: coinsignal-auto-blog
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -44,7 +46,7 @@ jobs:
         run: |
           pip install requests feedparser huggingface_hub pillow
 
-      - name: Generate and Publish 4 Articles
+      - name: Generate and Publish CoinSignal Articles
         run: |
           python <<'PY'
           import os
@@ -65,7 +67,6 @@ jobs:
 
           GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
           GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.6-flash"
-
           HF_TOKEN = os.environ["HF_TOKEN"]
 
           BLOG_ID = os.environ["BLOGGER_BLOG_ID"]
@@ -76,11 +77,14 @@ jobs:
           IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
           RSS_URL = "https://cointelegraph.com/rss"
 
-          ARTICLES_PER_RUN = 4
+          ARTICLES_PER_RUN = 1  # One article per run; 6 scheduled runs/day = 6 articles/day.
           IMAGE_DIR = Path("generated_images")
           IMAGE_DIR.mkdir(exist_ok=True)
-
           STATE_FILE = Path("published_sources.json")
+
+          GEMINI_MAX_ATTEMPTS = 4
+          GEMINI_MIN_GAP_SECONDS = 45
+          BLOGGER_REAUTH_ATTEMPTS = 2
 
           # ============================================================
           # GIT CONFIG
@@ -92,13 +96,51 @@ jobs:
           )
           subprocess.run(
               [
-                  "git",
-                  "config",
-                  "user.email",
+                  "git", "config", "user.email",
                   "coinsignal-bot@users.noreply.github.com"
               ],
               check=True
           )
+
+          # ============================================================
+          # DUPLICATE TRACKING HELPERS
+          # ============================================================
+
+          from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+          import hashlib
+
+          def normalize_url(value):
+              value = str(value or "").strip()
+              if not value:
+                  return ""
+              try:
+                  parts = urlsplit(value)
+                  clean_query = [
+                      (k, v)
+                      for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                      if not k.lower().startswith("utm_")
+                      and k.lower() not in {
+                          "fbclid", "gclid", "mc_cid", "mc_eid"
+                      }
+                  ]
+                  return urlunsplit((
+                      parts.scheme.lower(),
+                      parts.netloc.lower(),
+                      parts.path.rstrip("/"),
+                      urlencode(clean_query),
+                      ""
+                  ))
+              except Exception:
+                  return value.split("?")[0].rstrip("/")
+
+          def title_fingerprint(value):
+              normalized = re.sub(
+                  r"[^a-z0-9]+", " ",
+                  str(value or "").lower()
+              ).strip()
+              return hashlib.sha256(
+                  normalized.encode("utf-8")
+              ).hexdigest()
 
           # ============================================================
           # DUPLICATE TRACKING
@@ -106,19 +148,37 @@ jobs:
 
           if STATE_FILE.exists():
               try:
-                  state = json.loads(
+                  raw_state = json.loads(
                       STATE_FILE.read_text(encoding="utf-8")
                   )
               except Exception:
-                  state = []
+                  raw_state = []
           else:
-              state = []
+              raw_state = []
 
-          if not isinstance(state, list):
-              state = []
+          # Backward compatible with the old list-of-URLs format.
+          if isinstance(raw_state, list):
+              state = {
+                  "urls": list(raw_state),
+                  "titles": [],
+                  "fingerprints": []
+              }
+          elif isinstance(raw_state, dict):
+              state = {
+                  "urls": raw_state.get("urls", []),
+                  "titles": raw_state.get("titles", []),
+                  "fingerprints": raw_state.get("fingerprints", [])
+              }
+          else:
+              state = {"urls": [], "titles": [], "fingerprints": []}
 
-          # This source was already published successfully by the old
-          # one-article workflow, so do not publish it again.
+          published_urls = {
+              normalize_url(x) for x in state["urls"] if x
+          }
+          published_fingerprints = set(
+              x for x in state["fingerprints"] if x
+          )
+
           already_published_from_old_workflow = (
               "https://cointelegraph.com/news/"
               "hong-kong-jails-former-banker-over-16b-false-credit-"
@@ -127,20 +187,14 @@ jobs:
               "rss_partner_inbound"
           )
 
-          if (
-              already_published_from_old_workflow
-              not in state
-          ):
-              state.append(
-                  already_published_from_old_workflow
-              )
+          old_normalized = normalize_url(already_published_from_old_workflow)
+          if old_normalized not in published_urls:
+              state["urls"].append(already_published_from_old_workflow)
+              published_urls.add(old_normalized)
 
-          published_sources = set(state)
-
-          print(
-              "Previously published sources:",
-              len(published_sources)
-          )
+          print("Previously published URLs:", len(published_urls))
+          print("Previously published title fingerprints:",
+                len(published_fingerprints))
 
           # ============================================================
           # RSS
@@ -156,40 +210,50 @@ jobs:
 
           articles = []
 
-          for entry in feed.entries[:30]:
+          # Inspect more RSS candidates first so duplicates do not consume
+          # the small per-run article quota.
+          for entry in feed.entries[:50]:
               title = getattr(entry, "title", "").strip()
               link = getattr(entry, "link", "").strip()
+              summary = (
+                  getattr(entry, "summary", "")
+                  or getattr(entry, "description", "")
+                  or ""
+              ).strip()
 
               if not title or not link:
                   continue
 
-              if link in published_sources:
-                  print("SKIPPING ALREADY PUBLISHED:", title)
+              normalized = normalize_url(link)
+              fingerprint = title_fingerprint(title)
+
+              if normalized in published_urls:
+                  print("SKIPPING ALREADY PUBLISHED URL:", title)
+                  continue
+
+              if fingerprint in published_fingerprints:
+                  print("SKIPPING ALREADY PUBLISHED TITLE:", title)
                   continue
 
               articles.append({
                   "title": title,
-                  "link": link
+                  "link": link,
+                  "normalized_link": normalized,
+                  "title_fingerprint": fingerprint,
+                  "summary": re.sub(r"<[^>]+>", " ", summary)
               })
 
               if len(articles) >= ARTICLES_PER_RUN:
                   break
 
           if not articles:
-              raise Exception(
-                  "No new RSS articles available for this run."
-              )
+              raise Exception("No new RSS articles available for this run.")
 
           print("")
-          print(
-              f"Selected {len(articles)} new article(s) "
-              f"for this run."
-          )
+          print(f"Selected {len(articles)} new article(s) for this run.")
 
           for i, item in enumerate(articles, 1):
-              print(
-                  f"{i}. {item['title']}"
-              )
+              print(f"{i}. {item['title']}")
 
           # ============================================================
           # GEMINI JSON CLEANER
@@ -205,11 +269,7 @@ jobs:
                   flags=re.IGNORECASE
               )
 
-              text = re.sub(
-                  r"\s*```$",
-                  "",
-                  text
-              )
+              text = re.sub(r"\s*```$", "", text)
 
               start = text.find("{")
               end = text.rfind("}")
@@ -225,21 +285,39 @@ jobs:
               return text.strip()
 
           # ============================================================
-          # GEMINI ARTICLE
+          # GEMINI ARTICLE ENGINE
           # ============================================================
 
-          def generate_article(source):
+          def retry_wait_from_response(response, attempt):
+              retry_after = response.headers.get("Retry-After")
 
+              if retry_after:
+                  try:
+                      return min(max(int(float(retry_after)), 10), 600)
+                  except Exception:
+                      pass
+
+              # Longer, controlled backoff for quota/service errors.
+              waits = [30, 60, 120, 180, 240, 300]
+              return waits[min(attempt, len(waits) - 1)]
+
+          def generate_article(source):
               url = (
-                  f"https://generativelanguage.googleapis.com/"
+                  "https://generativelanguage.googleapis.com/"
                   f"v1beta/models/{GEMINI_MODEL}:generateContent"
               )
 
               prompt = f"""
-          You are a professional crypto and financial journalist writing for CoinSignal.
+          You are the senior crypto journalist, research editor, SEO strategist,
+          and audience-retention editor for CoinSignal.
 
-          Create an original, human-sounding, SEO-friendly crypto news article
-          based on the following current news topic:
+          CoinSignal is a professional crypto news and information publication.
+          Do NOT write like an RSS rewriter, generic AI blog, or promotional
+          clickbait site.
+
+          Your job is to turn the supplied current-news item into a genuinely
+          useful, original article that gives the reader a reason to stay on
+          the page.
 
           SOURCE TITLE:
           {source["title"]}
@@ -247,29 +325,89 @@ jobs:
           SOURCE URL:
           {source["link"]}
 
-          Requirements:
+          SOURCE SUMMARY:
+          {source["summary"]}
 
-          - Do not copy the source article.
-          - Write an original article.
-          - 900-1200 words.
-          - Strong SEO title.
-          - Attractive introduction.
-          - Use H2 and H3 headings.
-          - Explain important facts clearly.
-          - Include relevant Bitcoin/crypto context where appropriate.
-          - Avoid fake quotes.
-          - Do not invent statistics.
-          - Do not make unsupported claims.
-          - Keep the tone professional but engaging.
-          - Include a short conclusion.
-          - Include SEO-friendly HTML only inside html_content.
-          - Do NOT include markdown.
-          - Return ONLY valid JSON.
+          EDITORIAL RULES
+          1. Do not copy or closely paraphrase the source.
+          2. Do not invent facts, quotes, statistics, prices, dates, people,
+             partnerships, events, or market data.
+          3. Never manufacture a "verified resource", offer, giveaway, tool,
+             promotion, or external URL.
+          4. Treat the supplied source as the primary factual basis. If a fact
+             cannot be supported from the source information, phrase it
+             cautiously or leave it out.
+          5. Do not present speculation as fact.
+          6. Do not give personalized financial advice.
+          7. Clearly distinguish confirmed facts from analysis or possible
+             scenarios.
+          8. Use a professional, human newsroom tone.
+          9. Avoid repetitive AI phrases and filler.
+          10. Do not use fake quotes or quotation marks around invented text.
 
-          Required JSON format:
+          ARTICLE STRATEGY
+          - Start with a strong, specific hook that explains why the story
+            matters.
+          - Quickly answer: What happened?
+          - Explain the important background/context.
+          - Explain: Why does this matter to crypto users, investors, builders,
+            businesses, or the wider market?
+          - Explain the important numbers only when supported.
+          - Include a "What to Watch Next" section when there are meaningful
+            developments to monitor. Do not make guaranteed predictions.
+          - Include a concise "Key Takeaways" section.
+          - Include a "Useful Resources" section ONLY when a resource is
+            directly supported by the supplied source information. The original
+            source link may be included as an original-source link. Do not
+            invent other URLs.
+          - Add relevant internal-link placeholders using this exact format
+            only when genuinely relevant:
+            [INTERNAL: Bitcoin]
+            [INTERNAL: Ethereum]
+            [INTERNAL: Crypto News]
+            [INTERNAL: Altcoins]
+            [INTERNAL: Blockchain]
+            [INTERNAL: Regulation]
+            [INTERNAL: Market]
+            Do not create fake article URLs.
+          - The future CoinSignal site may contain its own crypto tools.
+            Do NOT claim a tool exists yet.
 
+          SEO
+          - Write a natural search-friendly title, not keyword stuffing.
+          - 900-1200 words when the topic supports that depth.
+          - Use H2/H3 headings.
+          - Make paragraphs short and readable on mobile.
+          - Use bullet lists where useful.
+          - Include a useful meta description of about 140-160 characters.
+
+          ARTICLE STRUCTURE
+          1. Hook/introduction
+          2. What happened
+          3. Key facts and context
+          4. Why it matters
+          5. What to watch next
+          6. Key takeaways
+          7. Useful resources (only if genuinely supported)
+          8. Original source
+          9. Short conclusion
+
+          HTML RULES
+          - Return clean Blogger-compatible HTML in html_content.
+          - Do not use Markdown.
+          - Do not include <html>, <head>, or <body>.
+          - Do not include scripts, iframes, forms, or unsafe embeds.
+          - Do not put the hero image in html_content; the workflow adds it.
+          - Keep external links limited to verified URLs actually supplied by
+            the source information.
+          - If using the source URL, make it a normal <a href="..."> link.
+
+          Return ONLY valid JSON.
+
+          Required JSON:
           {{
             "seo_title": "Article title",
+            "meta_description": "Short SEO meta description",
             "html_content": "<p>...</p><h2>...</h2>...",
             "labels": ["Crypto News", "Crypto", "Blockchain", "Markets"]
           }}
@@ -279,25 +417,21 @@ jobs:
                   "contents": [
                       {
                           "parts": [
-                              {
-                                  "text": prompt
-                              }
+                              {"text": prompt}
                           ]
                       }
                   ],
                   "generationConfig": {
-                      "temperature": 0.7,
+                      "temperature": 0.55,
                       "responseMimeType": "application/json"
                   }
               }
 
               last_error = None
 
-              for attempt in range(6):
+              for attempt in range(GEMINI_MAX_ATTEMPTS):
                   try:
-                      print(
-                          f"ARTICLE ATTEMPT {attempt + 1}/6"
-                      )
+                      print(f"ARTICLE ATTEMPT {attempt + 1}/{GEMINI_MAX_ATTEMPTS}")
 
                       response = requests.post(
                           url,
@@ -309,28 +443,40 @@ jobs:
                           timeout=180
                       )
 
-                      if response.status_code in [
-                          429, 500, 502, 503, 504
-                      ]:
+                      if response.status_code in [429, 500, 502, 503, 504]:
                           print(
-                              f"Gemini returned {response.status_code}"
+                              "Gemini API response:",
+                              response.text[:1500]
                           )
 
-                          wait = min(
-                              60 * (attempt + 1),
-                              300
-                          )
+                          wait = retry_wait_from_response(response, attempt)
 
                           print(
-                              f"Waiting {wait} seconds..."
+                              f"Gemini returned HTTP {response.status_code}; "
+                              f"waiting {wait} seconds before retry "
+                              f"{attempt + 2}/{GEMINI_MAX_ATTEMPTS}."
                           )
+
+                          if attempt == GEMINI_MAX_ATTEMPTS - 1:
+                              response.raise_for_status()
 
                           time.sleep(wait)
                           continue
 
+                      if not response.ok:
+                          print(
+                              "Gemini non-retryable response:",
+                              response.text[:1500]
+                          )
+
                       response.raise_for_status()
 
                       data = response.json()
+
+                      if not data.get("candidates"):
+                          raise Exception(
+                              "Gemini returned no candidates."
+                          )
 
                       text = (
                           data["candidates"][0]
@@ -340,10 +486,7 @@ jobs:
                       cleaned = clean_json_text(text)
 
                       try:
-                          result = json.loads(
-                              cleaned,
-                              strict=False
-                          )
+                          result = json.loads(cleaned, strict=False)
                       except json.JSONDecodeError:
                           cleaned = (
                               cleaned
@@ -351,44 +494,45 @@ jobs:
                               .replace("\n", " ")
                               .replace("\t", " ")
                           )
+                          result = json.loads(cleaned, strict=False)
 
-                          result = json.loads(
-                              cleaned,
-                              strict=False
-                          )
+                      required = [
+                          "seo_title",
+                          "html_content",
+                          "meta_description"
+                      ]
 
-                      if (
-                          "seo_title" not in result
-                          or "html_content" not in result
-                      ):
+                      missing = [
+                          key for key in required if key not in result
+                      ]
+
+                      if missing:
                           raise Exception(
-                              "Gemini JSON missing required fields."
+                              "Gemini JSON missing fields: "
+                              + ", ".join(missing)
                           )
+
+                      # Prevent accidental Markdown/code fences in Blogger.
+                      result["html_content"] = re.sub(
+                          r"```(?:html)?|```",
+                          "",
+                          result["html_content"],
+                          flags=re.IGNORECASE
+                      ).strip()
 
                       return result
 
                   except Exception as e:
                       last_error = e
+                      print("ARTICLE ERROR:", str(e))
 
-                      print(
-                          "ARTICLE ERROR:",
-                          str(e)
-                      )
-
-                      if attempt < 5:
-                          wait = min(
-                              60 * (attempt + 1),
-                              300
+                      if attempt < GEMINI_MAX_ATTEMPTS - 1:
+                          time.sleep(
+                              min(45 * (attempt + 1), 240)
                           )
-
-                          print(
-                              f"Retrying in {wait} seconds..."
-                          )
-
-                          time.sleep(wait)
 
               raise Exception(
-                  f"Article generation failed: {last_error}"
+                  f"Article generation failed after retries: {last_error}"
               )
 
           # ============================================================
@@ -396,7 +540,6 @@ jobs:
           # ============================================================
 
           def generate_image(prompt, output_file):
-
               print("")
               print("Starting Hugging Face image generation...")
               print("Model:", IMAGE_MODEL)
@@ -410,9 +553,7 @@ jobs:
 
               for attempt in range(12):
                   try:
-                      print(
-                          f"IMAGE ATTEMPT {attempt + 1}/12"
-                      )
+                      print(f"IMAGE ATTEMPT {attempt + 1}/12")
 
                       image = client.text_to_image(
                           prompt=prompt,
@@ -421,134 +562,190 @@ jobs:
 
                       image.save(output_file)
 
-                      print(
-                          "IMAGE GENERATED:",
-                          output_file
-                      )
-
+                      print("IMAGE GENERATED:", output_file)
                       return True
 
                   except Exception as e:
                       last_error = e
                       error_text = str(e)
 
-                      print(
-                          "IMAGE ERROR:",
-                          error_text
-                      )
+                      print("IMAGE ERROR:", error_text)
 
                       if any(
                           code in error_text
                           for code in [
-                              "429",
-                              "500",
-                              "502",
-                              "503",
-                              "504",
+                              "429", "500", "502", "503", "504",
                               "Too Many Requests",
                               "rate limit",
                               "temporarily unavailable"
                           ]
                       ):
-                          wait = min(
-                              300 * (attempt + 1),
-                              900
-                          )
-
-                          print(
-                              "Image service temporarily unavailable."
-                          )
-                          print(
-                              f"Waiting {wait} seconds before retry..."
-                          )
-
+                          wait = min(300 * (attempt + 1), 900)
+                          print(f"Waiting {wait} seconds before retry...")
                           time.sleep(wait)
                           continue
 
-                      print(
-                          "Non-retryable image error."
-                      )
                       break
 
-              print(
-                  "IMAGE GENERATION FAILED:",
-                  last_error
-              )
-
+              print("IMAGE GENERATION FAILED:", last_error)
               return False
 
           # ============================================================
-          # GOOGLE OAUTH
+          # GOOGLE OAUTH / BLOGGER AUTH
           # ============================================================
 
-          print("")
-          print("Refreshing Google OAuth token...")
+          def refresh_google_access_token():
+              print("")
+              print("Refreshing Google OAuth token...")
 
-          token_response = requests.post(
-              "https://oauth2.googleapis.com/token",
-              data={
-                  "client_id": CLIENT_ID,
-                  "client_secret": CLIENT_SECRET,
-                  "refresh_token": REFRESH_TOKEN,
-                  "grant_type": "refresh_token"
-              },
-              timeout=60
-          )
+              token_response = requests.post(
+                  "https://oauth2.googleapis.com/token",
+                  data={
+                      "client_id": CLIENT_ID,
+                      "client_secret": CLIENT_SECRET,
+                      "refresh_token": REFRESH_TOKEN,
+                      "grant_type": "refresh_token"
+                  },
+                  timeout=60
+              )
 
-          token_response.raise_for_status()
+              if not token_response.ok:
+                  safe_body = token_response.text[:1000]
+                  raise Exception(
+                      "Google OAuth refresh failed "
+                      f"(HTTP {token_response.status_code}): {safe_body}"
+                  )
 
-          access_token = token_response.json()["access_token"]
+              token_data = token_response.json()
 
-          # ============================================================
-          # BLOGGER URL
-          # ============================================================
+              if "access_token" not in token_data:
+                  raise Exception(
+                      "Google OAuth response did not contain access_token."
+                  )
+
+              return token_data["access_token"]
+
+          def blogger_headers(access_token):
+              return {
+                  "Authorization": f"Bearer {access_token}",
+                  "Content-Type": "application/json"
+              }
+
+          def validate_blogger_access(access_token):
+              url = (
+                  "https://blogger.googleapis.com/v3/blogs/"
+                  f"{BLOG_ID}"
+              )
+
+              response = requests.get(
+                  url,
+                  headers=blogger_headers(access_token),
+                  params={"fields": "id,name,url"},
+                  timeout=60
+              )
+
+              if response.status_code == 401:
+                  raise RuntimeError(
+                      "BLOGGER_AUTH_401: Google accepted the refresh request "
+                      "but Blogger rejected the access token. Re-authorize "
+                      "the Google OAuth refresh token with the Blogger scope "
+                      "'https://www.googleapis.com/auth/blogger' and update "
+                      "GOOGLE_REFRESH_TOKEN in GitHub Secrets."
+                  )
+
+              if response.status_code == 403:
+                  raise RuntimeError(
+                      "BLOGGER_AUTH_403: The Google account/token does not "
+                      "have permission to manage this Blogger blog. Check "
+                      "the Google account that owns/edits the blog and the "
+                      "Blogger OAuth scope."
+                  )
+
+              if response.status_code == 404:
+                  raise RuntimeError(
+                      "BLOGGER_BLOG_ID_404: BLOGGER_BLOG_ID was not found. "
+                      "Check that the GitHub Secret contains the numeric "
+                      "Blogger Blog ID for CoinSignal."
+                  )
+
+              response.raise_for_status()
+
+              blog = response.json()
+
+              if str(blog.get("id")) != str(BLOG_ID):
+                  raise RuntimeError(
+                      "Blogger returned a different blog ID than the "
+                      "configured BLOGGER_BLOG_ID."
+                  )
+
+              print(
+                  "Blogger authorization verified:",
+                  blog.get("name"),
+                  blog.get("url")
+              )
+
+          access_token = refresh_google_access_token()
+
+          # Fail before spending Gemini/FLUX quota if Blogger auth is broken.
+          blogger_auth_ok = False
+
+          for auth_attempt in range(BLOGGER_REAUTH_ATTEMPTS):
+              try:
+                  validate_blogger_access(access_token)
+                  blogger_auth_ok = True
+                  break
+              except RuntimeError as e:
+                  print(str(e))
+
+                  if "BLOGGER_AUTH_401" in str(e) and auth_attempt == 0:
+                      print("Refreshing Google token one more time...")
+                      access_token = refresh_google_access_token()
+                      continue
+
+                  raise
+
+          if not blogger_auth_ok:
+              raise Exception("Blogger authorization could not be verified.")
 
           blogger_url = (
-              f"https://www.googleapis.com/blogger/v3/blogs/"
-              f"{BLOG_ID}/posts/"
+              "https://blogger.googleapis.com/v3/blogs/"
+              f"{BLOG_ID}/posts"
           )
 
           # ============================================================
-          # PROCESS 4 ARTICLES SEQUENTIALLY
+          # PROCESS ARTICLES SEQUENTIALLY
           # ============================================================
 
           successful = 0
           failed = 0
+          last_gemini_call_time = 0
 
           print("")
           print("====================================")
           print(f"STARTING BATCH: {len(articles)} ARTICLES")
           print("====================================")
 
-          for article_number, source in enumerate(
-              articles, 1
-          ):
+          for article_number, source in enumerate(articles, 1):
 
               print("")
               print("####################################")
-              print(
-                  f"ARTICLE {article_number}/{len(articles)}"
-              )
+              print(f"ARTICLE {article_number}/{len(articles)}")
               print("SOURCE:", source["title"])
               print("####################################")
 
               try:
-
-                  # ----------------------------
-                  # Generate article
-                  # ----------------------------
+                  # Keep a gap between Gemini calls to reduce burst 429s.
+                  elapsed = time.time() - last_gemini_call_time
+                  if elapsed < GEMINI_MIN_GAP_SECONDS:
+                      time.sleep(
+                          GEMINI_MIN_GAP_SECONDS - elapsed
+                      )
 
                   article = generate_article(source)
+                  last_gemini_call_time = time.time()
 
                   print("")
-                  print(
-                      "ARTICLE TITLE:",
-                      article["seo_title"]
-                  )
-
-                  # ----------------------------
-                  # Generate image
-                  # ----------------------------
+                  print("ARTICLE TITLE:", article["seo_title"])
 
                   safe_name = re.sub(
                       r"[^a-zA-Z0-9_-]+",
@@ -556,10 +753,7 @@ jobs:
                       article["seo_title"].lower()
                   )[:80].strip("-")
 
-                  image_path = (
-                      IMAGE_DIR /
-                      f"{safe_name}.png"
-                  )
+                  image_path = IMAGE_DIR / f"{safe_name}.png"
 
                   image_prompt = f"""
           Create a professional editorial image for a cryptocurrency
@@ -571,10 +765,9 @@ jobs:
           Style:
           premium financial news photography,
           modern cryptocurrency market atmosphere,
-          Bitcoin and blockchain visual elements where relevant,
-          realistic lighting,
-          sophisticated newsroom/editorial aesthetic,
+          realistic newsroom/editorial aesthetic,
           cinematic composition,
+          sophisticated lighting,
           high detail,
           no text,
           no logos,
@@ -587,14 +780,9 @@ jobs:
                       image_path
                   )
 
-                  # ----------------------------
-                  # GitHub image URL
-                  # ----------------------------
-
                   image_url = None
 
                   if image_ok:
-
                       subprocess.run(
                           ["git", "add", str(image_path)],
                           check=True
@@ -602,13 +790,8 @@ jobs:
 
                       commit = subprocess.run(
                           [
-                              "git",
-                              "commit",
-                              "-m",
-                              (
-                                  "Add image for "
-                                  f"{article['seo_title']}"
-                              )
+                              "git", "commit", "-m",
+                              f"Add image for {article['seo_title']}"
                           ],
                           capture_output=True,
                           text=True
@@ -620,9 +803,7 @@ jobs:
                               check=True
                           )
                       else:
-                          print(
-                              "Image commit returned no changes."
-                          )
+                          print("Image commit returned no changes.")
 
                       repo = os.environ.get(
                           "GITHUB_REPOSITORY",
@@ -635,46 +816,28 @@ jobs:
                           f"{image_path.as_posix()}"
                       )
 
-                      print(
-                          "IMAGE URL:",
-                          image_url
-                      )
-
-                  # ----------------------------
-                  # Add image to article
-                  # ----------------------------
+                      print("IMAGE URL:", image_url)
 
                   html_content = article["html_content"]
 
                   if image_url:
-
                       image_html = f"""
           <p style="text-align:center;">
           <img
-            src="{image_url}"
-            alt="{html.escape(article["seo_title"])}"
-            style="max-width:100%;height:auto;"
-            loading="lazy"
+          src="{image_url}"
+          alt="{html.escape(article["seo_title"])}"
+          style="max-width:100%;height:auto;"
+          loading="lazy"
           />
           </p>
           """
 
-                      html_content = (
-                          image_html +
-                          html_content
-                      )
+                      html_content = image_html + html_content
 
                   else:
                       print(
-                          "Image unavailable. "
-                          "Publishing article without image."
+                          "Image unavailable. Publishing article without image."
                       )
-
-                  # ----------------------------
-                  # Blogger publish
-                  # ----------------------------
-
-                  print("Publishing to Blogger...")
 
                   labels = article.get(
                       "labels",
@@ -686,24 +849,88 @@ jobs:
                       ]
                   )
 
+                  # Keep Blogger payload types safe even if Gemini returns
+                  # an unexpected JSON shape.
+                  if not isinstance(labels, list):
+                      labels = [str(labels)] if labels else []
+
+                  labels = [
+                      str(label).strip()
+                      for label in labels
+                      if str(label).strip()
+                  ][:10]
+
+                  if not labels:
+                      labels = [
+                          "Crypto News",
+                          "Crypto",
+                          "Blockchain",
+                          "Markets"
+                      ]
+
+                  title = str(article.get("seo_title", "")).strip()
+                  meta_description = str(
+                      article.get("meta_description", "")
+                  ).strip()
+                  html_content = str(
+                      html_content or ""
+                  ).strip()
+
+                  if not title:
+                      raise ValueError(
+                          "Gemini returned an empty seo_title."
+                      )
+
+                  if not html_content:
+                      raise ValueError(
+                          "Gemini returned empty html_content."
+                      )
+
                   blogger_payload = {
                       "kind": "blogger#post",
-                      "title": article["seo_title"],
+                      "title": title,
                       "content": html_content,
                       "labels": labels
                   }
 
-                  blogger_response = requests.post(
-                      blogger_url,
-                      headers={
-                          "Authorization":
-                              f"Bearer {access_token}",
-                          "Content-Type":
-                              "application/json"
-                      },
-                      json=blogger_payload,
-                      timeout=120
-                  )
+                  print("Publishing to Blogger...")
+
+                  # Retry once after a fresh OAuth token if Blogger returns 401.
+                  blogger_response = None
+
+                  for publish_attempt in range(2):
+                      blogger_response = requests.post(
+                          blogger_url,
+                          headers=blogger_headers(access_token),
+                          json=blogger_payload,
+                          timeout=120
+                      )
+
+                      if blogger_response.status_code != 401:
+                          break
+
+                      print(
+                          "Blogger returned 401. Refreshing Google OAuth "
+                          "token and retrying once..."
+                      )
+                      access_token = refresh_google_access_token()
+                      validate_blogger_access(access_token)
+
+                  if blogger_response.status_code == 401:
+                      raise RuntimeError(
+                          "BLOGGER_AUTH_401_AFTER_REFRESH: Blogger still "
+                          "rejected the refreshed token. The GitHub "
+                          "GOOGLE_REFRESH_TOKEN must be regenerated using "
+                          "the Blogger write scope and the Google OAuth app "
+                          "should be moved to Production rather than Testing."
+                      )
+
+                  if blogger_response.status_code == 403:
+                      raise RuntimeError(
+                          "BLOGGER_AUTH_403_ON_PUBLISH: Token is valid but "
+                          "the authorized Google account cannot publish to "
+                          "this blog. Check Blogger author/admin permissions."
+                      )
 
                   blogger_response.raise_for_status()
 
@@ -713,90 +940,76 @@ jobs:
                   print("====================================")
                   print("SUCCESS")
                   print("====================================")
-                  print(
-                      "ARTICLE:",
-                      f"{article_number}/{len(articles)}"
-                  )
-                  print(
-                      "TITLE:",
-                      article["seo_title"]
-                  )
-                  print(
-                      "BLOGGER URL:",
-                      published.get("url")
-                  )
-                  print(
-                      "IMAGE:",
-                      "YES" if image_url else "NO"
-                  )
+                  print("ARTICLE:", f"{article_number}/{len(articles)}")
+                  print("TITLE:", article["seo_title"])
+                  print("BLOGGER URL:", published.get("url"))
+                  print("IMAGE:", "YES" if image_url else "NO")
                   print("====================================")
 
-                  # ----------------------------
-                  # Mark source as published
-                  # ----------------------------
+                  # Mark source only AFTER Blogger confirms publication.
+                  normalized_source = normalize_url(source["link"])
+                  source_fingerprint = title_fingerprint(source["title"])
 
-                  if source["link"] not in published_sources:
-                      published_sources.add(
-                          source["link"]
-                      )
-                      state.append(
-                          source["link"]
-                      )
+                  if normalized_source not in published_urls:
+                      state["urls"].append(source["link"])
+                      published_urls.add(normalized_source)
 
-                      STATE_FILE.write_text(
-                          json.dumps(
-                              state,
-                              indent=2,
-                              ensure_ascii=False
-                          ),
-                          encoding="utf-8"
-                      )
+                  if source_fingerprint not in published_fingerprints:
+                      state["fingerprints"].append(source_fingerprint)
+                      published_fingerprints.add(source_fingerprint)
 
-                      subprocess.run(
-                          ["git", "add", str(STATE_FILE)],
-                          check=True
-                      )
+                  STATE_FILE.write_text(
+                      json.dumps(
+                          state,
+                          indent=2,
+                          ensure_ascii=False
+                      ),
+                      encoding="utf-8"
+                  )
 
-                      state_commit = subprocess.run(
-                          [
-                              "git",
-                              "commit",
-                              "-m",
-                              (
-                                  "Track published source: "
-                                  f"{article['seo_title']}"
-                              )
-                          ],
+                  subprocess.run(
+                      ["git", "add", str(STATE_FILE)],
+                      check=True
+                  )
+
+                  state_commit = subprocess.run(
+                      [
+                          "git", "commit", "-m",
+                          f"Track published source: {article['seo_title']}"
+                      ],
+                      capture_output=True,
+                      text=True
+                  )
+
+                  if state_commit.returncode == 0:
+                      push = subprocess.run(
+                          ["git", "push"],
                           capture_output=True,
                           text=True
                       )
 
-                      if state_commit.returncode == 0:
-                          subprocess.run(
-                              ["git", "push"],
-                              check=True
+                      if push.returncode != 0:
+                          print(
+                              "WARNING: Blogger publish succeeded but "
+                              "state push failed. The article is still "
+                              "published; duplicate protection may rely "
+                              "on URL/title checks on the next run."
                           )
+                          print("git push stderr:", push.stderr[:1500])
+                  else:
+                      print("State commit returned no changes.")
 
                   successful += 1
 
               except Exception as e:
-
                   failed += 1
 
                   print("")
                   print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                  print(
-                      f"ARTICLE {article_number} FAILED"
-                  )
-                  print(
-                      "ERROR:",
-                      str(e)
-                  )
-                  print(
-                      "Continuing with next article..."
-                  )
+                  print(f"ARTICLE {article_number} FAILED")
+                  print("ERROR:", str(e))
+                  print("Continuing with next article...")
                   print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-
                   continue
 
           # ============================================================
@@ -807,27 +1020,16 @@ jobs:
           print("====================================")
           print("BATCH COMPLETE")
           print("====================================")
-          print(
-              "REQUESTED:",
-              ARTICLES_PER_RUN
-          )
-          print(
-              "SELECTED:",
-              len(articles)
-          )
-          print(
-              "PUBLISHED:",
-              successful
-          )
-          print(
-              "FAILED:",
-              failed
-          )
+          print("REQUESTED:", ARTICLES_PER_RUN)
+          print("SELECTED:", len(articles))
+          print("PUBLISHED:", successful)
+          print("FAILED:", failed)
           print("====================================")
 
           if successful == 0:
               raise Exception(
-                  "No articles were published successfully."
+                  "No articles were published successfully. "
+                  "Review the Gemini/Blogger error messages above."
               )
 
           PY
