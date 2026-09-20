@@ -1,5 +1,7 @@
 name: CoinSignal Auto Blog
 
+# V5.9 — controlled 500-attempt resilience, bounded backoff, duplicate-safe Blogger retries
+
 on:
   workflow_dispatch:
   schedule:
@@ -22,7 +24,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # GitHub-hosted runner maximum; retry loops persist within this window.
+    timeout-minutes: 360  # Final platform/job ceiling; individual retry loops remain bounded.
 
     env:
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
@@ -58,55 +60,49 @@ jobs:
           import html
           import subprocess
           from pathlib import Path
-
+          
           import requests
           import feedparser
           from huggingface_hub import InferenceClient
-
+          
           # ============================================================
           # CONFIG
           # ============================================================
-
+          
           GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
           GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.6-flash"
           HF_TOKEN = os.environ["HF_TOKEN"]
-
+          
           BLOG_ID = os.environ["BLOGGER_BLOG_ID"]
           CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
           CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
           REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
-
+          
           FACEBOOK_PAGE_ID = os.environ.get("FACEBOOK_PAGE_ID", "").strip()
           FACEBOOK_PAGE_ACCESS_TOKEN = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
           FACEBOOK_GRAPH_VERSION = "v23.0"
           FACEBOOK_DAILY_LIMIT = 3
           FACEBOOK_STATE_FILE = Path("facebook_state.json")
-
+          
           IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
           RSS_URL = "https://cointelegraph.com/rss"
-
+          
           ARTICLES_PER_RUN = 1  # One article per run; 6 scheduled runs/day = 6 articles/day.
           IMAGE_DIR = Path("generated_images")
           IMAGE_DIR.mkdir(exist_ok=True)
           STATE_FILE = Path("published_sources.json")
-
-          # Retry transient Gemini/service failures continuously until the
-          # article is generated successfully. GitHub-hosted jobs have a
-          # maximum execution window, so the runner itself can still stop
-          # after that platform limit.
-          # Resilience policy: retry transient/service failures up to 500 attempts.
-          # The GitHub-hosted runner itself is limited to 360 minutes, so this
-          # protects against temporary outages without pretending the platform
-          # can run forever.
+          
+          # Resilience policy: temporary failures may be retried up to 500 times.
+          # Backoff is deliberately capped so the workflow does not spend hours
+          # sleeping between attempts. The GitHub job timeout remains the final
+          # platform-level upper bound.
           MAX_RETRY_ATTEMPTS = 500
-          GEMINI_RETRY_FOREVER = True
-          GEMINI_MIN_GAP_SECONDS = 45
-          BLOGGER_REAUTH_ATTEMPTS = MAX_RETRY_ATTEMPTS
-
+          GEMINI_MIN_GAP_SECONDS = 20
+          
           # ============================================================
           # GIT CONFIG
           # ============================================================
-
+          
           subprocess.run(
               ["git", "config", "user.name", "CoinSignal Bot"],
               check=True
@@ -118,14 +114,14 @@ jobs:
               ],
               check=True
           )
-
+          
           # ============================================================
           # DUPLICATE TRACKING HELPERS
           # ============================================================
-
+          
           from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
           import hashlib
-
+          
           def normalize_url(value):
               value = str(value or "").strip()
               if not value:
@@ -149,7 +145,7 @@ jobs:
                   ))
               except Exception:
                   return value.split("?")[0].rstrip("/")
-
+          
           def title_fingerprint(value):
               normalized = re.sub(
                   r"[^a-z0-9]+", " ",
@@ -158,11 +154,11 @@ jobs:
               return hashlib.sha256(
                   normalized.encode("utf-8")
               ).hexdigest()
-
+          
           # ============================================================
           # DUPLICATE TRACKING
           # ============================================================
-
+          
           if STATE_FILE.exists():
               try:
                   raw_state = json.loads(
@@ -172,7 +168,7 @@ jobs:
                   raw_state = []
           else:
               raw_state = []
-
+          
           # Backward compatible with the old list-of-URLs format.
           if isinstance(raw_state, list):
               state = {
@@ -188,14 +184,14 @@ jobs:
               }
           else:
               state = {"urls": [], "titles": [], "fingerprints": []}
-
+          
           published_urls = {
               normalize_url(x) for x in state["urls"] if x
           }
           published_fingerprints = set(
               x for x in state["fingerprints"] if x
           )
-
+          
           already_published_from_old_workflow = (
               "https://cointelegraph.com/news/"
               "hong-kong-jails-former-banker-over-16b-false-credit-"
@@ -203,23 +199,23 @@ jobs:
               "?utm_source=rss_feed&utm_medium=rss&utm_campaign="
               "rss_partner_inbound"
           )
-
+          
           old_normalized = normalize_url(already_published_from_old_workflow)
           if old_normalized not in published_urls:
               state["urls"].append(already_published_from_old_workflow)
               published_urls.add(old_normalized)
-
+          
           print("Previously published URLs:", len(published_urls))
           print("Previously published title fingerprints:",
                 len(published_fingerprints))
-
+          
           # ============================================================
           # RSS
           # ============================================================
-
+          
           print("")
           print("Fetching crypto news...")
-
+          
           feed = None
           for rss_attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
               try:
@@ -232,12 +228,12 @@ jobs:
               wait = min(30 * (2 ** min(rss_attempt - 1, 5)), 300)
               print(f"Waiting {wait}s before RSS retry {rss_attempt + 1}/{MAX_RETRY_ATTEMPTS}...")
               time.sleep(wait)
-
+          
           if feed is None or not feed.entries:
               raise Exception(f"No RSS articles found after {MAX_RETRY_ATTEMPTS} attempts.")
-
+          
           articles = []
-
+          
           # Inspect more RSS candidates first so duplicates do not consume
           # the small per-run article quota.
           for entry in feed.entries[:50]:
@@ -248,21 +244,21 @@ jobs:
                   or getattr(entry, "description", "")
                   or ""
               ).strip()
-
+          
               if not title or not link:
                   continue
-
+          
               normalized = normalize_url(link)
               fingerprint = title_fingerprint(title)
-
+          
               if normalized in published_urls:
                   print("SKIPPING ALREADY PUBLISHED URL:", title)
                   continue
-
+          
               if fingerprint in published_fingerprints:
                   print("SKIPPING ALREADY PUBLISHED TITLE:", title)
                   continue
-
+          
               articles.append({
                   "title": title,
                   "link": link,
@@ -270,93 +266,87 @@ jobs:
                   "title_fingerprint": fingerprint,
                   "summary": re.sub(r"<[^>]+>", " ", summary)
               })
-
+          
               if len(articles) >= ARTICLES_PER_RUN:
                   break
-
+          
           if not articles:
               print("No new RSS articles available for this run. Nothing to publish; exiting successfully.")
               raise SystemExit(0)
-
+          
           print("")
           print(f"Selected {len(articles)} new article(s) for this run.")
-
+          
           for i, item in enumerate(articles, 1):
               print(f"{i}. {item['title']}")
-
+          
           # ============================================================
-          # GEMINI JSON CLEANER
+          # GEMINI ARTICLE ENGINE
           # ============================================================
-
+          
+          RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+          
+          
+          def retry_wait(response=None, attempt=1):
+              """Return a bounded retry delay. Honor Retry-After, but cap it."""
+              if response is not None:
+                  retry_after = response.headers.get("Retry-After")
+                  if retry_after:
+                      try:
+                          return min(max(int(float(retry_after)), 5), 120)
+                      except Exception:
+                          pass
+          
+              steps = [5, 10, 20, 30, 45, 60]
+              return steps[min(max(attempt - 1, 0), len(steps) - 1)]
+          
+          
+          def is_retryable_http(status_code):
+              return status_code in RETRYABLE_HTTP_STATUSES
+          
+          
           def clean_json_text(text):
               text = text.strip()
-
-              text = re.sub(
-                  r"^```(?:json)?\s*",
-                  "",
-                  text,
-                  flags=re.IGNORECASE
-              )
-
+              text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
               text = re.sub(r"\s*```$", "", text)
-
               start = text.find("{")
               end = text.rfind("}")
-
               if start != -1 and end != -1:
                   text = text[start:end + 1]
-
               text = "".join(
                   ch if ord(ch) >= 32 or ch in "\n\t\r" else " "
                   for ch in text
               )
-
               return text.strip()
-
-          # ============================================================
-          # GEMINI ARTICLE ENGINE
-          # ============================================================
-
-          def retry_wait_from_response(response, attempt):
-              retry_after = response.headers.get("Retry-After")
-
-              if retry_after:
-                  try:
-                      return min(max(int(float(retry_after)), 10), 600)
-                  except Exception:
-                      pass
-
-              # Longer, controlled backoff for quota/service errors.
-              waits = [30, 60, 120, 180, 240, 300]
-              return waits[min(attempt, len(waits) - 1)]
-
+          
+          
           def generate_article(source):
               url = (
                   "https://generativelanguage.googleapis.com/"
                   f"v1beta/models/{GEMINI_MODEL}:generateContent"
               )
-
+          
               prompt = f"""
           You are the senior crypto journalist, research editor, SEO strategist,
           and audience-retention editor for CoinSignal.
-
+          
           CoinSignal is a professional crypto news and information publication.
           Do NOT write like an RSS rewriter, generic AI blog, or promotional
           clickbait site.
-
+          
           Your job is to turn the supplied current-news item into a genuinely
           useful, original article that gives the reader a reason to stay on
           the page.
-
+          
           SOURCE TITLE:
           {source["title"]}
-
+          
           SOURCE URL:
           {source["link"]}
-
+          
           SOURCE SUMMARY:
           {source["summary"]}
-
+          
           EDITORIAL RULES
           1. Do not copy or closely paraphrase the source.
           2. Do not invent facts, quotes, statistics, prices, dates, people,
@@ -373,7 +363,7 @@ jobs:
           8. Use a professional, human newsroom tone.
           9. Avoid repetitive AI phrases and filler.
           10. Do not use fake quotes or quotation marks around invented text.
-
+          
           ARTICLE STRATEGY
           - Start with a strong, specific hook that explains why the story
             matters.
@@ -401,7 +391,7 @@ jobs:
             Do not create fake article URLs.
           - The future CoinSignal site may contain its own crypto tools.
             Do NOT claim a tool exists yet.
-
+          
           SEO
           - Write a natural search-friendly title, not keyword stuffing.
           - 900-1200 words when the topic supports that depth.
@@ -409,7 +399,7 @@ jobs:
           - Make paragraphs short and readable on mobile.
           - Use bullet lists where useful.
           - Include a useful meta description of about 140-160 characters.
-
+          
           ARTICLE STRUCTURE
           1. Hook/introduction
           2. What happened
@@ -420,7 +410,7 @@ jobs:
           7. Useful resources (only if genuinely supported)
           8. Original source
           9. Short conclusion
-
+          
           HTML RULES
           - Return clean Blogger-compatible HTML in html_content.
           - Do not use Markdown.
@@ -430,9 +420,9 @@ jobs:
           - Keep external links limited to verified URLs actually supplied by
             the source information.
           - If using the source URL, make it a normal <a href="..."> link.
-
+          
           Return ONLY valid JSON.
-
+          
           Required JSON:
           {{
             "seo_title": "Article title",
@@ -441,26 +431,20 @@ jobs:
             "labels": ["Crypto News", "Crypto", "Blockchain", "Markets"]
           }}
           """
-
+          
               payload = {
-                  "contents": [
-                      {
-                          "parts": [
-                              {"text": prompt}
-                          ]
-                      }
-                  ],
+                  "contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {
                       "temperature": 0.55,
                       "responseMimeType": "application/json"
                   }
               }
-
-              attempt = 0
-              while True:
-                  attempt += 1
-                  print(f"ARTICLE ATTEMPT {attempt} (automatic retry until success)")
-
+          
+              last_error = None
+          
+              for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                  print(f"ARTICLE ATTEMPT {attempt}/{MAX_RETRY_ATTEMPTS}")
+          
                   try:
                       response = requests.post(
                           url,
@@ -471,107 +455,105 @@ jobs:
                           json=payload,
                           timeout=180
                       )
-
-                      if response.status_code in [429, 500, 502, 503, 504]:
-                          print("Gemini API response:", response.text[:1500])
-                          wait = retry_wait_from_response(response, attempt - 1)
-                          print(
-                              f"Gemini returned HTTP {response.status_code}; "
-                              f"waiting {wait} seconds before automatic retry."
-                          )
-                          time.sleep(wait)
-                          continue
-
+          
                       if not response.ok:
-                          # User-requested resilience policy: do not abandon the
-                          # article because of an unexpected API status. Retry
-                          # all HTTP failures within the runner window.
-                          print(
-                              f"Gemini HTTP {response.status_code}; treating as "
-                              "retryable and continuing automatically."
+                          last_error = RuntimeError(
+                              f"Gemini HTTP {response.status_code}: {response.text[:1500]}"
                           )
                           print("Gemini API response:", response.text[:1500])
-                          wait = min(30 * (2 ** min(attempt - 1, 5)), 600)
+          
+                          if not is_retryable_http(response.status_code):
+                              raise last_error
+          
+                          if attempt < MAX_RETRY_ATTEMPTS:
+                              wait = retry_wait(response, attempt)
+                              print(
+                                  f"Retryable Gemini HTTP {response.status_code}; "
+                                  f"waiting {wait}s before attempt {attempt + 1}."
+                              )
+                              time.sleep(wait)
+                              continue
+                          break
+          
+                      try:
+                          data = response.json()
+                          if not data.get("candidates"):
+                              raise ValueError("Gemini returned no candidates.")
+          
+                          parts = data["candidates"][0].get("content", {}).get("parts", [])
+                          if not parts or "text" not in parts[0]:
+                              raise ValueError("Gemini response contained no text part.")
+          
+                          cleaned = clean_json_text(parts[0]["text"])
+                          result = json.loads(cleaned, strict=False)
+          
+                          required = ["seo_title", "html_content", "meta_description"]
+                          missing = [key for key in required if key not in result]
+                          if missing:
+                              raise ValueError(
+                                  "Gemini JSON missing fields: " + ", ".join(missing)
+                              )
+          
+                          result["html_content"] = re.sub(
+                              r"```(?:html)?|```",
+                              "",
+                              str(result["html_content"]),
+                              flags=re.IGNORECASE
+                          ).strip()
+          
+                          if not result["seo_title"].strip():
+                              raise ValueError("Gemini seo_title is empty.")
+                          if not result["html_content"].strip():
+                              raise ValueError("Gemini html_content is empty.")
+          
+                          print(f"Gemini article generation SUCCESS on attempt {attempt}.")
+                          return result
+          
+                      except (json.JSONDecodeError, KeyError, IndexError, ValueError, TypeError) as e:
+                          last_error = e
+                          print("Gemini output error:", str(e))
+          
+                          if attempt < MAX_RETRY_ATTEMPTS:
+                              wait = retry_wait(attempt=attempt)
+                              print(
+                                  f"Malformed/empty Gemini output; waiting {wait}s "
+                                  f"before attempt {attempt + 1}."
+                              )
+                              time.sleep(wait)
+                              continue
+                          break
+          
+                  except requests.RequestException as e:
+                      last_error = e
+                      print("Gemini network/request error:", str(e))
+          
+                      if attempt < MAX_RETRY_ATTEMPTS:
+                          wait = retry_wait(attempt=attempt)
                           print(
-                              f"Waiting {wait} seconds before automatic retry "
-                              f"{attempt + 1}/{MAX_RETRY_ATTEMPTS}."
+                              f"Gemini network error; waiting {wait}s "
+                              f"before attempt {attempt + 1}."
                           )
                           time.sleep(wait)
                           continue
-
-                      data = response.json()
-
-                      if not data.get("candidates"):
-                          raise ValueError("Gemini returned no candidates.")
-
-                      text = (
-                          data["candidates"][0]
-                          ["content"]["parts"][0]["text"]
-                      )
-
-                      cleaned = clean_json_text(text)
-
-                      try:
-                          result = json.loads(cleaned, strict=False)
-                      except json.JSONDecodeError:
-                          cleaned = (
-                              cleaned
-                              .replace("\r", " ")
-                              .replace("\n", " ")
-                              .replace("\t", " ")
-                          )
-                          result = json.loads(cleaned, strict=False)
-
-                      required = [
-                          "seo_title",
-                          "html_content",
-                          "meta_description"
-                      ]
-
-                      missing = [key for key in required if key not in result]
-                      if missing:
-                          raise ValueError(
-                              "Gemini JSON missing fields: " + ", ".join(missing)
-                          )
-
-                      result["html_content"] = re.sub(
-                          r"```(?:html)?|```",
-                          "",
-                          result["html_content"],
-                          flags=re.IGNORECASE
-                      ).strip()
-
-                      print(f"Gemini article generation SUCCESS on attempt {attempt}.")
-                      return result
-
-                  except requests.RequestException as e:
-                      print("Gemini network/request error:", str(e))
-                      wait = min(30 * (2 ** min(attempt - 1, 5)), 600)
-                      print(f"Waiting {wait} seconds before automatic retry.")
-                      time.sleep(wait)
-                      continue
-
-                  except (json.JSONDecodeError, KeyError, IndexError, ValueError) as e:
-                      # Malformed/empty model output is treated as transient so
-                      # the article is retried automatically instead of being lost.
-                      print("Gemini output error:", str(e))
-                      wait = min(30 * (2 ** min(attempt - 1, 5)), 600)
-                      print(f"Waiting {wait} seconds before automatic retry.")
-                      time.sleep(wait)
-                      continue
-
+                      break
+          
+              raise RuntimeError(
+                  f"Gemini article generation failed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}"
+              )
+          
           # ============================================================
           # HUGGING FACE IMAGE
           # ============================================================
-
+          
+          
           def generate_image(prompt, output_file):
               print("")
               print("Starting Hugging Face image generation...")
               print("Model:", IMAGE_MODEL)
-
+          
               client = InferenceClient(provider="auto", api_key=HF_TOKEN)
               last_error = None
-
+          
               for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
                   try:
                       print(f"IMAGE ATTEMPT {attempt}/{MAX_RETRY_ATTEMPTS}")
@@ -579,244 +561,451 @@ jobs:
                       image.save(output_file)
                       print("IMAGE GENERATED:", output_file)
                       return True
+          
                   except Exception as e:
                       last_error = e
-                      error_text = str(e)
-                      print("IMAGE ERROR:", error_text)
-                      wait = min(30 * (2 ** min(attempt - 1, 5)), 600)
-                      print(f"Waiting {wait} seconds before retry {attempt + 1}/{MAX_RETRY_ATTEMPTS}...")
-                      time.sleep(wait)
-
+                      error_text = str(e).lower()
+                      print("IMAGE ERROR:", str(e))
+          
+                      permanent_markers = [
+                          "401", "403", "unauthorized", "forbidden",
+                          "invalid token", "invalid api", "model not found",
+                          "not found", "bad request", "400"
+                      ]
+                      if any(marker in error_text for marker in permanent_markers):
+                          raise RuntimeError(
+                              f"Hugging Face image generation returned a non-retryable error: {e}"
+                          )
+          
+                      if attempt < MAX_RETRY_ATTEMPTS:
+                          wait = retry_wait(attempt=attempt)
+                          print(
+                              f"Temporary image-generation error; waiting {wait}s "
+                              f"before attempt {attempt + 1}."
+                          )
+                          time.sleep(wait)
+          
               raise RuntimeError(
-                  f"Image generation did not succeed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}"
+                  f"Image generation failed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}"
               )
-
-
+          
           # ============================================================
           # GOOGLE OAUTH / BLOGGER AUTH
           # ============================================================
-
+          
           def refresh_google_access_token():
               print("")
               print("Refreshing Google OAuth token...")
-
-              token_response = requests.post(
-                  "https://oauth2.googleapis.com/token",
-                  data={
-                      "client_id": CLIENT_ID,
-                      "client_secret": CLIENT_SECRET,
-                      "refresh_token": REFRESH_TOKEN,
-                      "grant_type": "refresh_token"
-                  },
-                  timeout=60
+          
+              token_url = "https://oauth2.googleapis.com/token"
+              last_error = None
+          
+              for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                  try:
+                      response = requests.post(
+                          token_url,
+                          data={
+                              "client_id": CLIENT_ID,
+                              "client_secret": CLIENT_SECRET,
+                              "refresh_token": REFRESH_TOKEN,
+                              "grant_type": "refresh_token"
+                          },
+                          timeout=60
+                      )
+          
+                      if response.ok:
+                          data = response.json()
+                          if "access_token" not in data:
+                              raise RuntimeError(
+                                  "Google OAuth response did not contain access_token."
+                              )
+                          print("Google OAuth access token refreshed successfully.")
+                          return data["access_token"]
+          
+                      body = response.text[:1000]
+                      last_error = RuntimeError(
+                          f"Google OAuth refresh failed HTTP {response.status_code}: {body}"
+                      )
+          
+                      # Invalid refresh tokens/client credentials are not transient.
+                      if response.status_code not in RETRYABLE_HTTP_STATUSES:
+                          raise last_error
+          
+                      if attempt < MAX_RETRY_ATTEMPTS:
+                          wait = retry_wait(response, attempt)
+                          print(f"Google OAuth retry in {wait}s ({attempt + 1}/{MAX_RETRY_ATTEMPTS}).")
+                          time.sleep(wait)
+          
+                  except requests.RequestException as e:
+                      last_error = e
+                      if attempt < MAX_RETRY_ATTEMPTS:
+                          wait = retry_wait(attempt=attempt)
+                          print(f"Google OAuth network error; retrying in {wait}s ({attempt + 1}/{MAX_RETRY_ATTEMPTS}).")
+                          time.sleep(wait)
+          
+              raise RuntimeError(
+                  f"Google OAuth refresh failed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}"
               )
-
-              if not token_response.ok:
-                  safe_body = token_response.text[:1000]
-                  raise Exception(
-                      "Google OAuth refresh failed "
-                      f"(HTTP {token_response.status_code}): {safe_body}"
-                  )
-
-              token_data = token_response.json()
-
-              if "access_token" not in token_data:
-                  raise Exception(
-                      "Google OAuth response did not contain access_token."
-                  )
-
-              return token_data["access_token"]
-
+          
+          
           def blogger_headers(access_token):
               return {
                   "Authorization": f"Bearer {access_token}",
                   "Content-Type": "application/json"
               }
-
+          
+          
           def validate_blogger_access(access_token):
-              url = (
-                  "https://blogger.googleapis.com/v3/blogs/"
-                  f"{BLOG_ID}"
-              )
-
-              response = requests.get(
-                  url,
-                  headers=blogger_headers(access_token),
-                  params={"fields": "id,name,url"},
-                  timeout=60
-              )
-
+              url = f"https://blogger.googleapis.com/v3/blogs/{BLOG_ID}"
+          
+              try:
+                  response = requests.get(
+                      url,
+                      headers=blogger_headers(access_token),
+                      params={"fields": "id,name,url"},
+                      timeout=60
+                  )
+              except requests.RequestException as e:
+                  raise RuntimeError(
+                      f"BLOGGER_VALIDATION_RETRYABLE_NETWORK: {e}"
+                  ) from e
+          
               if response.status_code == 401:
                   raise RuntimeError(
-                      "BLOGGER_AUTH_401: Google accepted the refresh request "
-                      "but Blogger rejected the access token. Re-authorize "
-                      "the Google OAuth refresh token with the Blogger scope "
-                      "'https://www.googleapis.com/auth/blogger' and update "
-                      "GOOGLE_REFRESH_TOKEN in GitHub Secrets."
+                      "BLOGGER_AUTH_401: Blogger rejected the access token. "
+                      "The workflow will refresh Google OAuth and retry."
                   )
-
+          
               if response.status_code == 403:
                   raise RuntimeError(
-                      "BLOGGER_AUTH_403: The Google account/token does not "
-                      "have permission to manage this Blogger blog. Check "
-                      "the Google account that owns/edits the blog and the "
-                      "Blogger OAuth scope."
+                      "BLOGGER_AUTH_403: The Google account/token does not have "
+                      "permission to manage this Blogger blog. Check the Google "
+                      "account and Blogger OAuth scope."
                   )
-
+          
               if response.status_code == 404:
                   raise RuntimeError(
                       "BLOGGER_BLOG_ID_404: BLOGGER_BLOG_ID was not found. "
-                      "Check that the GitHub Secret contains the numeric "
-                      "Blogger Blog ID for CoinSignal."
+                      "Check the GitHub Secret."
                   )
-
-              response.raise_for_status()
-
+          
+              if not response.ok:
+                  if is_retryable_http(response.status_code):
+                      raise RuntimeError(
+                          f"BLOGGER_VALIDATION_RETRYABLE_{response.status_code}: {response.text[:1000]}"
+                      )
+                  raise RuntimeError(
+                      f"BLOGGER_VALIDATION_HTTP_{response.status_code}: {response.text[:1000]}"
+                  )
+          
               blog = response.json()
-
               if str(blog.get("id")) != str(BLOG_ID):
                   raise RuntimeError(
-                      "Blogger returned a different blog ID than the "
-                      "configured BLOGGER_BLOG_ID."
+                      "Blogger returned a different blog ID than BLOGGER_BLOG_ID."
                   )
-
-              print(
-                  "Blogger authorization verified:",
-                  blog.get("name"),
-                  blog.get("url")
+          
+              print("Blogger authorization verified:", blog.get("name"), blog.get("url"))
+          
+          
+          def get_verified_blogger_access_token():
+              access_token = refresh_google_access_token()
+          
+              for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                  try:
+                      validate_blogger_access(access_token)
+                      return access_token
+                  except RuntimeError as e:
+                      message = str(e)
+                      print(message)
+          
+                      if "BLOGGER_AUTH_401" in message:
+                          print("Blogger returned 401; refreshing Google OAuth token...")
+                          access_token = refresh_google_access_token()
+                          continue
+          
+                      if "BLOGGER_VALIDATION_RETRYABLE_" in message:
+                          if attempt < MAX_RETRY_ATTEMPTS:
+                              wait = retry_wait(attempt=attempt)
+                              print(f"Blogger validation retry in {wait}s ({attempt + 1}/{MAX_RETRY_ATTEMPTS}).")
+                              time.sleep(wait)
+                              continue
+          
+                      raise
+          
+              raise RuntimeError(
+                  f"Blogger authorization validation failed after {MAX_RETRY_ATTEMPTS} attempts."
               )
-
-          access_token = refresh_google_access_token()
-
-          # Fail before spending Gemini/FLUX quota if Blogger auth is broken.
-          blogger_auth_ok = False
-
-          for auth_attempt in range(BLOGGER_REAUTH_ATTEMPTS):
-              try:
-                  validate_blogger_access(access_token)
-                  blogger_auth_ok = True
-                  break
-              except RuntimeError as e:
-                  print(str(e))
-
-                  if "BLOGGER_AUTH_401" in str(e) and auth_attempt == 0:
-                      print("Refreshing Google token one more time...")
-                      access_token = refresh_google_access_token()
-                      continue
-
-                  raise
-
-          if not blogger_auth_ok:
-              raise Exception("Blogger authorization could not be verified.")
-
-          blogger_url = (
+          
+          
+          access_token = get_verified_blogger_access_token()
+          
+          blogger_posts_url = (
               "https://blogger.googleapis.com/v3/blogs/"
               f"{BLOG_ID}/posts"
           )
-
+          
+          
+          def find_existing_blogger_post(title, access_token):
+              """Protect against duplicate posts after a timeout/connection loss."""
+              try:
+                  response = requests.get(
+                      blogger_posts_url,
+                      headers=blogger_headers(access_token),
+                      params={
+                          "maxResults": 50,
+                          "fetchBodies": "false"
+                      },
+                      timeout=60
+                  )
+          
+                  if not response.ok:
+                      print(
+                          "Blogger duplicate-check skipped; HTTP",
+                          response.status_code
+                      )
+                      return None
+          
+                  wanted = re.sub(r"\s+", " ", str(title or "").strip()).casefold()
+                  for item in response.json().get("items", []):
+                      existing = re.sub(
+                          r"\s+", " ", str(item.get("title", "")).strip()
+                      ).casefold()
+                      if existing and existing == wanted:
+                          print("Existing Blogger post detected; reusing it:", item.get("url"))
+                          return item
+              except requests.RequestException as e:
+                  print("Blogger duplicate-check network error:", str(e))
+              except Exception as e:
+                  print("Blogger duplicate-check error:", str(e))
+          
+              return None
+          
           # ============================================================
           # PROCESS ARTICLES SEQUENTIALLY
           # ============================================================
-
+          
           def load_facebook_state():
               today = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 5 * 3600))
               default = {"date": today, "count": 0, "urls": []}
-              if not FACEBOOK_STATE_FILE.exists(): return default
+          
+              if not FACEBOOK_STATE_FILE.exists():
+                  return default
+          
               try:
                   state = json.loads(FACEBOOK_STATE_FILE.read_text(encoding="utf-8"))
-                  if state.get("date") != today: return default
-                  return {"date": today, "count": int(state.get("count", 0)), "urls": list(state.get("urls", []))}
-              except Exception: return default
-
+                  if state.get("date") != today:
+                      return default
+          
+                  return {
+                      "date": today,
+                      "count": int(state.get("count", 0)),
+                      "urls": list(state.get("urls", []))
+                  }
+              except Exception as e:
+                  print("FACEBOOK STATE READ ERROR:", str(e))
+                  return default
+          
+          
+          def git_push_with_retry(label):
+              last_output = ""
+          
+              for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                  result = subprocess.run(
+                      ["git", "push"],
+                      capture_output=True,
+                      text=True
+                  )
+          
+                  if result.returncode == 0:
+                      print(f"Git push SUCCESS: {label}")
+                      return True
+          
+                  last_output = (result.stderr or result.stdout or "").strip()
+                  print(f"Git push failed for {label} (attempt {attempt}/{MAX_RETRY_ATTEMPTS}):")
+                  print(last_output[:1500])
+          
+                  permanent = [
+                      "authentication failed",
+                      "repository not found",
+                      "permission denied",
+                      "could not read from remote repository",
+                      "403",
+                      "401"
+                  ]
+                  lowered = last_output.lower()
+                  if any(marker in lowered for marker in permanent):
+                      raise RuntimeError(
+                          f"Git push has a non-retryable authentication/permission error for {label}: {last_output[:2000]}"
+                      )
+          
+                  if attempt < MAX_RETRY_ATTEMPTS:
+                      wait = retry_wait(attempt=attempt)
+                      print(f"Waiting {wait}s before Git push retry...")
+                      time.sleep(wait)
+          
+              raise RuntimeError(
+                  f"Git push failed after {MAX_RETRY_ATTEMPTS} attempts for {label}: {last_output[:2000]}"
+              )
+          
+          
+          def commit_and_push(path, message, label):
+              subprocess.run(["git", "add", str(path)], check=True)
+          
+              commit = subprocess.run(
+                  ["git", "commit", "-m", message],
+                  capture_output=True,
+                  text=True
+              )
+          
+              if commit.returncode != 0:
+                  combined = (commit.stdout or "") + "\n" + (commit.stderr or "")
+                  if "nothing to commit" in combined.lower():
+                      print(f"Git: no changes to commit for {label}.")
+                      return True
+                  raise RuntimeError(
+                      f"Git commit failed for {label}: {combined[:2000]}"
+                  )
+          
+              return git_push_with_retry(label)
+          
+          
           def save_facebook_state(state):
-              FACEBOOK_STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-              subprocess.run(["git", "add", str(FACEBOOK_STATE_FILE)], check=True)
-              commit = subprocess.run(["git", "commit", "-m", "Track Facebook Page posts"], capture_output=True, text=True)
-              if commit.returncode == 0: subprocess.run(["git", "push"], check=True)
-
+              FACEBOOK_STATE_FILE.write_text(
+                  json.dumps(state, indent=2, ensure_ascii=False),
+                  encoding="utf-8"
+              )
+              commit_and_push(
+                  FACEBOOK_STATE_FILE,
+                  "Track Facebook Page posts",
+                  "Facebook state"
+              )
+          
+          
+          def facebook_post_once(title, summary, article_url):
+              message = f"{title}\n\n{summary}"
+              url = (
+                  f"https://graph.facebook.com/{FACEBOOK_GRAPH_VERSION}/"
+                  f"{FACEBOOK_PAGE_ID}/feed"
+              )
+          
+              response = requests.post(
+                  url,
+                  data={
+                      "message": message,
+                      "link": article_url,
+                      "access_token": FACEBOOK_PAGE_ACCESS_TOKEN
+                  },
+                  timeout=120
+              )
+              return response
+          
+          
           def publish_to_facebook(title, summary, article_url, image_url):
               if not FACEBOOK_PAGE_ID or not FACEBOOK_PAGE_ACCESS_TOKEN:
-                  raise RuntimeError("FACEBOOK_CONFIGURATION_ERROR: Page ID or Page Access Token is missing.")
-
+                  print("FACEBOOK: configuration secrets are missing; skipping Page post.")
+                  return False
+          
               state = load_facebook_state()
               normalized = normalize_url(article_url)
-
+          
               if normalized in {normalize_url(x) for x in state["urls"]}:
                   print("FACEBOOK: duplicate article; skipping.")
                   return False
-
+          
               if state["count"] >= FACEBOOK_DAILY_LIMIT:
                   print("FACEBOOK: daily limit 3 reached; pausing until next PKT day.")
                   return False
-
+          
+              # Facebook /feed creates the Page link post. The article itself supplies
+              # its preview image through its metadata/theme; image_url is retained in
+              # the function signature for compatibility with the workflow.
+              _ = image_url
+          
               short_detail = re.sub(r"<[^>]+>", " ", str(summary or ""))
               short_detail = re.sub(r"\s+", " ", short_detail).strip()
               if len(short_detail) > 420:
                   short_detail = short_detail[:417].rsplit(" ", 1)[0] + "..."
-
-              message = f"{title}\n\n{short_detail}"
-              url = f"https://graph.facebook.com/{FACEBOOK_GRAPH_VERSION}/{FACEBOOK_PAGE_ID}/feed"
-
+          
               last_error = None
+          
               for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
                   try:
-                      response = requests.post(
-                          url,
-                          data={
-                              "message": message,
-                              "link": article_url,
-                              "access_token": FACEBOOK_PAGE_ACCESS_TOKEN
-                          },
-                          timeout=120
-                      )
-
+                      response = facebook_post_once(title, short_detail, article_url)
+          
                       if response.ok:
                           data = response.json()
+          
+                          # Only update/push state AFTER Facebook confirms the post.
                           state["count"] += 1
                           state["urls"].append(article_url)
                           save_facebook_state(state)
+          
                           print("FACEBOOK PAGE PUBLISHED:", data.get("id", "OK"))
-                          print(f"FACEBOOK DAILY COUNT: {state['count']}/{FACEBOOK_DAILY_LIMIT}")
+                          print(
+                              f"FACEBOOK DAILY COUNT: "
+                              f"{state['count']}/{FACEBOOK_DAILY_LIMIT}"
+                          )
                           return True
-
+          
                       last_error = RuntimeError(
                           f"HTTP {response.status_code}: {response.text[:2000]}"
                       )
+          
                       print("FACEBOOK PUBLISH FAILED:", response.status_code)
                       print("FACEBOOK RESPONSE:", response.text[:2000])
-
+          
+                      # Permission/configuration errors will not become valid by retrying.
+                      if not is_retryable_http(response.status_code):
+                          raise last_error
+          
+                      if attempt < MAX_RETRY_ATTEMPTS:
+                          wait = retry_wait(response, attempt)
+                          print(
+                              f"FACEBOOK temporary HTTP {response.status_code}; "
+                              f"waiting {wait}s before attempt {attempt + 1}."
+                          )
+                          time.sleep(wait)
+          
                   except requests.RequestException as e:
                       last_error = e
                       print("FACEBOOK NETWORK ERROR:", str(e))
-
-                  wait = min(30 * (2 ** min(attempt - 1, 5)), 600)
-                  print(f"FACEBOOK: waiting {wait}s before retry {attempt + 1}/{MAX_RETRY_ATTEMPTS}...")
-                  time.sleep(wait)
-
+                      if attempt < MAX_RETRY_ATTEMPTS:
+                          wait = retry_wait(attempt=attempt)
+                          print(
+                              f"FACEBOOK network retry in {wait}s "
+                              f"({attempt + 1}/{MAX_RETRY_ATTEMPTS})."
+                          )
+                          time.sleep(wait)
+          
               raise RuntimeError(
-                  f"Facebook publishing did not succeed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}"
+                  f"Facebook publishing failed after {MAX_RETRY_ATTEMPTS} attempts: {last_error}"
               )
-
-
+          
+          
           successful = 0
           failed = 0
           facebook_published = 0
           facebook_failed = 0
           last_gemini_call_time = 0
-
+          successful = 0
+          failed = 0
+          facebook_published = 0
+          facebook_failed = 0
+          last_gemini_call_time = 0
+          
           print("")
           print("====================================")
           print(f"STARTING BATCH: {len(articles)} ARTICLES")
           print("====================================")
-
+          
           for article_number, source in enumerate(articles, 1):
-
+          
               print("")
               print("####################################")
               print(f"ARTICLE {article_number}/{len(articles)}")
               print("SOURCE:", source["title"])
               print("####################################")
-
+          
               try:
                   # Keep a gap between Gemini calls to reduce burst 429s.
                   elapsed = time.time() - last_gemini_call_time
@@ -824,28 +1013,28 @@ jobs:
                       time.sleep(
                           GEMINI_MIN_GAP_SECONDS - elapsed
                       )
-
+          
                   article = generate_article(source)
                   last_gemini_call_time = time.time()
-
+          
                   print("")
                   print("ARTICLE TITLE:", article["seo_title"])
-
+          
                   safe_name = re.sub(
                       r"[^a-zA-Z0-9_-]+",
                       "-",
                       article["seo_title"].lower()
                   )[:80].strip("-")
-
+          
                   image_path = IMAGE_DIR / f"{safe_name}.png"
-
+          
                   image_prompt = f"""
           Create a professional editorial image for a cryptocurrency
           news article.
-
+          
           Article headline:
           {article["seo_title"]}
-
+          
           Style:
           premium financial news photography,
           modern cryptocurrency market atmosphere,
@@ -858,20 +1047,20 @@ jobs:
           no watermarks,
           16:9 landscape composition.
           """
-
+          
                   image_ok = generate_image(
                       image_prompt,
                       image_path
                   )
-
+          
                   image_url = None
-
+          
                   if image_ok:
                       subprocess.run(
                           ["git", "add", str(image_path)],
                           check=True
                       )
-
+          
                       commit = subprocess.run(
                           [
                               "git", "commit", "-m",
@@ -880,30 +1069,33 @@ jobs:
                           capture_output=True,
                           text=True
                       )
-
+          
                       if commit.returncode == 0:
-                          subprocess.run(
-                              ["git", "push"],
-                              check=True
-                          )
+                          git_push_with_retry("Generated image")
                       else:
-                          print("Image commit returned no changes.")
-
+                          combined = (commit.stdout or "") + "\n" + (commit.stderr or "")
+                          if "nothing to commit" in combined.lower():
+                              print("Image commit returned no changes; existing image is already tracked.")
+                          else:
+                              raise RuntimeError(
+                                  f"Image git commit failed: {combined[:2000]}"
+                              )
+          
                       repo = os.environ.get(
                           "GITHUB_REPOSITORY",
                           "waqas4868/coinsignal-auto-blog"
                       )
-
+          
                       image_url = (
                           "https://raw.githubusercontent.com/"
                           f"{repo}/main/"
                           f"{image_path.as_posix()}"
                       )
-
+          
                       print("IMAGE URL:", image_url)
-
+          
                   html_content = article["html_content"]
-
+          
                   if image_url:
                       image_html = f"""
           <p style="text-align:center;">
@@ -915,14 +1107,14 @@ jobs:
           />
           </p>
           """
-
+          
                       html_content = image_html + html_content
-
+          
                   else:
                       print(
                           "Image unavailable. Publishing article without image."
                       )
-
+          
                   labels = article.get(
                       "labels",
                       [
@@ -932,18 +1124,18 @@ jobs:
                           "Markets"
                       ]
                   )
-
+          
                   # Keep Blogger payload types safe even if Gemini returns
                   # an unexpected JSON shape.
                   if not isinstance(labels, list):
                       labels = [str(labels)] if labels else []
-
+          
                   labels = [
                       str(label).strip()
                       for label in labels
                       if str(label).strip()
                   ][:10]
-
+          
                   if not labels:
                       labels = [
                           "Crypto News",
@@ -951,7 +1143,7 @@ jobs:
                           "Blockchain",
                           "Markets"
                       ]
-
+          
                   title = str(article.get("seo_title", "")).strip()
                   meta_description = str(
                       article.get("meta_description", "")
@@ -959,84 +1151,152 @@ jobs:
                   html_content = str(
                       html_content or ""
                   ).strip()
-
+          
                   if not title:
                       raise ValueError(
                           "Gemini returned an empty seo_title."
                       )
-
+          
                   if not html_content:
                       raise ValueError(
                           "Gemini returned empty html_content."
                       )
-
+          
                   blogger_payload = {
                       "kind": "blogger#post",
                       "title": title,
                       "content": html_content,
                       "labels": labels
                   }
-
+          
                   print("Publishing to Blogger...")
-
-                  # Keep retrying Blogger publish until it succeeds or the
-                  # GitHub runner reaches its platform execution limit.
-                  blogger_response = None
-                  last_blogger_error = None
-
-                  for publish_attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
-                      try:
-                          blogger_response = requests.post(
-                              blogger_url,
-                              headers=blogger_headers(access_token),
-                              json=blogger_payload,
-                              timeout=120
-                          )
-
-                          if blogger_response.ok:
+          
+                  # First check recent live posts so a network timeout after a
+                  # successful Blogger write does not create a duplicate.
+                  published = find_existing_blogger_post(title, access_token)
+          
+                  if published:
+                      print("Blogger post already exists; no second POST will be made.")
+                  else:
+                      blogger_response = None
+                      last_blogger_error = None
+          
+                      for publish_attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+                          try:
+                              blogger_response = requests.post(
+                                  blogger_posts_url,
+                                  headers=blogger_headers(access_token),
+                                  json=blogger_payload,
+                                  timeout=120
+                              )
+          
+                              if blogger_response.ok:
+                                  published = blogger_response.json()
+                                  break
+          
+                              print(
+                                  f"BLOGGER PUBLISH FAILED HTTP {blogger_response.status_code}: "
+                                  f"{blogger_response.text[:1500]}"
+                              )
+          
+                              if blogger_response.status_code == 401:
+                                  print("Blogger 401: refreshing Google OAuth token before retry.")
+                                  access_token = refresh_google_access_token()
+                                  validate_blogger_access(access_token)
+                                  last_blogger_error = RuntimeError(
+                                      "Blogger returned 401; OAuth token refreshed."
+                                  )
+          
+                              elif is_retryable_http(blogger_response.status_code):
+                                  last_blogger_error = RuntimeError(
+                                      f"HTTP {blogger_response.status_code}: {blogger_response.text[:1500]}"
+                                  )
+          
+                                  # Before repeating a POST, check whether the previous
+                                  # request actually created the post.
+                                  existing = find_existing_blogger_post(title, access_token)
+                                  if existing:
+                                      published = existing
+                                      print(
+                                          "Existing Blogger post found after failed "
+                                          "response; treating publish as successful."
+                                      )
+                                      break
+          
+                              else:
+                                  raise RuntimeError(
+                                      f"Blogger publishing returned non-retryable HTTP "
+                                      f"{blogger_response.status_code}: {blogger_response.text[:1500]}"
+                                  )
+          
+                          except requests.RequestException as e:
+                              last_blogger_error = e
+                              print("BLOGGER NETWORK ERROR:", str(e))
+          
+                              # A timeout may still mean Blogger created the post.
+                              existing = find_existing_blogger_post(title, access_token)
+                              if existing:
+                                  published = existing
+                                  print(
+                                      "Existing Blogger post found after network error; "
+                                      "treating publish as successful."
+                                  )
+                                  break
+          
+                          if published:
                               break
-
-                          print(
-                              f"BLOGGER PUBLISH FAILED HTTP {blogger_response.status_code}: "
-                              f"{blogger_response.text[:1500]}"
+          
+                          if publish_attempt < MAX_RETRY_ATTEMPTS:
+                              wait_response = (
+                                  blogger_response
+                                  if blogger_response is not None
+                                  and is_retryable_http(blogger_response.status_code)
+                                  else None
+                              )
+                              wait = retry_wait(wait_response, publish_attempt)
+                              print(
+                                  f"BLOGGER: waiting {wait}s before retry "
+                                  f"{publish_attempt + 1}/{MAX_RETRY_ATTEMPTS}..."
+                              )
+                              time.sleep(wait)
+          
+                      if not published:
+                          # Final duplicate check before declaring failure.
+                          published = find_existing_blogger_post(title, access_token)
+          
+                      if not published:
+                          raise RuntimeError(
+                              f"Blogger publishing did not succeed after "
+                              f"{MAX_RETRY_ATTEMPTS} attempts: {last_blogger_error}"
                           )
-
-                          if blogger_response.status_code == 401:
-                              print("Blogger 401: refreshing Google OAuth token before retry.")
-                              access_token = refresh_google_access_token()
-                              validate_blogger_access(access_token)
-
-                          last_blogger_error = RuntimeError(
-                              f"HTTP {blogger_response.status_code}: {blogger_response.text[:1500]}"
-                          )
-
-                      except requests.RequestException as e:
-                          last_blogger_error = e
-                          print("BLOGGER NETWORK ERROR:", str(e))
-
-                      wait = min(30 * (2 ** min(publish_attempt - 1, 5)), 600)
-                      print(
-                          f"BLOGGER: waiting {wait}s before retry "
-                          f"{publish_attempt + 1}/{MAX_RETRY_ATTEMPTS}..."
-                      )
-                      time.sleep(wait)
-
-                  if blogger_response is None or not blogger_response.ok:
-                      raise RuntimeError(
-                          f"Blogger publishing did not succeed after {MAX_RETRY_ATTEMPTS} attempts: {last_blogger_error}"
-                      )
-
-                  published = blogger_response.json()
-
+          
                   # Publish to Facebook only after Blogger confirms the article.
                   blogger_url = published.get("url")
                   if blogger_url and image_url:
-                      if publish_to_facebook(article["seo_title"], article.get("meta_description", ""), blogger_url, image_url):
-                          facebook_published += 1
-                      else:
-                          print("FACEBOOK: no Page post made (daily limit, duplicate, missing image, or configuration).")
+                      try:
+                          if publish_to_facebook(
+                              article["seo_title"],
+                              article.get("meta_description", ""),
+                              blogger_url,
+                              image_url
+                          ):
+                              facebook_published += 1
+                          else:
+                              print(
+                                  "FACEBOOK: skipped (daily limit, duplicate, or "
+                                  "missing configuration)."
+                              )
+                      except Exception as facebook_error:
+                          facebook_failed += 1
+                          print("FACEBOOK FINAL ERROR:", str(facebook_error))
+                          print(
+                              "Blogger article is already published; this run will "
+                              "not republish the article."
+                          )
                   else:
-                      print("FACEBOOK: skipped because Blogger URL or image URL is unavailable.")
+                      print(
+                          "FACEBOOK: skipped because Blogger URL or image URL is unavailable."
+                      )
                   print("====================================")
                   print("SUCCESS")
                   print("====================================")
@@ -1045,19 +1305,19 @@ jobs:
                   print("BLOGGER URL:", published.get("url"))
                   print("IMAGE:", "YES" if image_url else "NO")
                   print("====================================")
-
+          
                   # Mark source only AFTER Blogger confirms publication.
                   normalized_source = normalize_url(source["link"])
                   source_fingerprint = title_fingerprint(source["title"])
-
+          
                   if normalized_source not in published_urls:
                       state["urls"].append(source["link"])
                       published_urls.add(normalized_source)
-
+          
                   if source_fingerprint not in published_fingerprints:
                       state["fingerprints"].append(source_fingerprint)
                       published_fingerprints.add(source_fingerprint)
-
+          
                   STATE_FILE.write_text(
                       json.dumps(
                           state,
@@ -1066,12 +1326,12 @@ jobs:
                       ),
                       encoding="utf-8"
                   )
-
+          
                   subprocess.run(
                       ["git", "add", str(STATE_FILE)],
                       check=True
                   )
-
+          
                   state_commit = subprocess.run(
                       [
                           "git", "commit", "-m",
@@ -1080,30 +1340,23 @@ jobs:
                       capture_output=True,
                       text=True
                   )
-
+          
                   if state_commit.returncode == 0:
-                      push = subprocess.run(
-                          ["git", "push"],
-                          capture_output=True,
-                          text=True
-                      )
-
-                      if push.returncode != 0:
-                          print(
-                              "WARNING: Blogger publish succeeded but "
-                              "state push failed. The article is still "
-                              "published; duplicate protection may rely "
-                              "on URL/title checks on the next run."
-                          )
-                          print("git push stderr:", push.stderr[:1500])
+                      git_push_with_retry("Published source state")
                   else:
-                      print("State commit returned no changes.")
-
+                      combined = (state_commit.stdout or "") + "\n" + (state_commit.stderr or "")
+                      if "nothing to commit" in combined.lower():
+                          print("State commit returned no changes.")
+                      else:
+                          raise RuntimeError(
+                              f"Published-source state commit failed: {combined[:2000]}"
+                          )
+          
                   successful += 1
-
+          
               except Exception as e:
                   failed += 1
-
+          
                   print("")
                   print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                   print(f"ARTICLE {article_number} FAILED")
@@ -1111,11 +1364,11 @@ jobs:
                   print("Continuing with next article...")
                   print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                   continue
-
+          
           # ============================================================
           # FINAL REPORT
           # ============================================================
-
+          
           print("")
           print("====================================")
           print("BATCH COMPLETE")
@@ -1127,12 +1380,11 @@ jobs:
           print("FACEBOOK PUBLISHED:", facebook_published)
           print("FACEBOOK FAILED:", facebook_failed)
           print("====================================")
-
+          
           if successful == 0:
               raise Exception(
                   "No articles were published successfully. The workflow exhausted its "
                   "retry window or encountered a configuration/non-retryable error. "
                   "Review the service logs above."
               )
-
           PY
