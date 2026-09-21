@@ -1,8 +1,12 @@
 # CoinSignal SINGLE-FILE production workflow
-# VERSION: 2026-09-21-FACEBOOK-POST-ONLY-FIX-11
+# VERSION: 2026-09-21-FACEBOOK-PAGE-TOKEN-AUTO-RESOLVE-FIX-12
 # MAJOR FIXES: publisher critical path isolated from Facebook, no Git state commit before Blogger, runner-local checkpoint, required image, service-pause/quota handling for external services, local Facebook idempotency without reading the Page feed, cautious handling of uncertain Facebook POST outcomes, robust Git commits, runtime preflight.
 # IMPORTANT: Replace the entire previous workflow file with this exact file.
 # Facebook worker change: it no longer calls GET /PAGE_ID/feed for duplicate checks; it uses durable local state instead.
+# Token change: FACEBOOK_PAGE_ACCESS_TOKEN may contain either a Page Access Token or a User Access Token.
+# If it is a User Access Token, the worker automatically resolves the configured Page Access Token
+# through /me/accounts and uses that Page token for the actual Page POST.
+# Queue change: known Code 200 permission-blocked items are safely reopened after token resolution.
 # Do not paste only the Python block; dependency preflight and runtime safety checks are part of the fix.
 name: CoinSignal Auto Blog - Final Single File
 
@@ -134,7 +138,7 @@ jobs:
           import feedparser
           from huggingface_hub import InferenceClient
           
-          CODE_VERSION = "2026-09-21-FACEBOOK-POST-ONLY-FIX-11"
+          CODE_VERSION = "2026-09-21-FACEBOOK-PAGE-TOKEN-AUTO-RESOLVE-FIX-12"
           PKT = ZoneInfo("Asia/Karachi")
           RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
           MAX_RETRY_WAIT = 120
@@ -1460,11 +1464,13 @@ jobs:
               return f"https://graph.facebook.com/{FACEBOOK_GRAPH_VERSION}/{page_id}{suffix}"
           
           
-          def validate_page_token(cfg: dict[str, str]) -> None:
+          def validate_direct_page_token(cfg: dict[str, str]) -> None:
+              """Validate the token currently stored in cfg as a Page token."""
+              token = cfg["FACEBOOK_PAGE_ACCESS_TOKEN"]
               try:
                   response = requests.get(
                       facebook_url(cfg["FACEBOOK_PAGE_ID"]),
-                      params={"fields": "id,name", "access_token": cfg["FACEBOOK_PAGE_ACCESS_TOKEN"]},
+                      params={"fields": "id,name", "access_token": token},
                       timeout=30,
                   )
               except requests.RequestException as exc:
@@ -1485,6 +1491,141 @@ jobs:
               if str(data.get("id")) != str(cfg["FACEBOOK_PAGE_ID"]):
                   raise NonRetryableError("FACEBOOK_PAGE_ID does not match the Page returned by the access token")
               print("Facebook Page verified:", data.get("name"), data.get("id"))
+
+
+          def facebook_permissions_for_user(token: str) -> set[str]:
+              """Return granted Facebook permissions for a User Access Token."""
+              try:
+                  response = requests.get(
+                      facebook_url("me", "permissions"),
+                      params={"access_token": token},
+                      timeout=30,
+                  )
+              except requests.RequestException as exc:
+                  raise_service_pause("facebook", f"User-token permission check network error: {exc}")
+              if response.status_code == 429:
+                  if is_hard_quota_response(response):
+                      raise_hard_quota("facebook", f"HTTP 429: {response_text(response)}")
+                  seconds = retry_after_seconds(response)
+                  resume = (now_utc() + timedelta(seconds=seconds)).isoformat(timespec="seconds") if seconds else None
+                  raise_service_pause("facebook", f"HTTP 429: {response_text(response)}", resume_at=resume)
+              if response.status_code >= 500:
+                  raise_service_pause("facebook", f"User-token permission check HTTP {response.status_code}: {response_text(response)}")
+              if not response.ok:
+                  raise NonRetryableError(
+                      f"Facebook User Access Token permission check failed HTTP {response.status_code}: {response_text(response)}"
+                  )
+              rows = response.json().get("data", [])
+              granted = {
+                  str(row.get("permission", "")).strip()
+                  for row in rows
+                  if str(row.get("status", "")).strip().lower() == "granted"
+              }
+              return granted
+
+
+          def resolve_page_access_token(cfg: dict[str, str]) -> None:
+              """Accept either a Page token or a User token in the existing GitHub secret.
+
+              If the stored token is a User Access Token, automatically obtain the matching
+              Page Access Token from /me/accounts and use that Page token for publishing.
+              If /me/accounts rejects the token as a Page token, fall back to direct Page-token validation.
+              """
+              configured_token = cfg["FACEBOOK_PAGE_ACCESS_TOKEN"].strip()
+              if not configured_token:
+                  raise NonRetryableError("FACEBOOK_PAGE_ACCESS_TOKEN is empty")
+
+              try:
+                  response = requests.get(
+                      facebook_url("me", "accounts"),
+                      params={
+                          "fields": "id,name,access_token,tasks",
+                          "limit": 100,
+                          "access_token": configured_token,
+                      },
+                      timeout=45,
+                  )
+              except requests.RequestException as exc:
+                  raise_service_pause("facebook", f"Facebook /me/accounts network error: {exc}")
+
+              if response.status_code == 429:
+                  if is_hard_quota_response(response):
+                      raise_hard_quota("facebook", f"HTTP 429: {response_text(response)}")
+                  seconds = retry_after_seconds(response)
+                  resume = (now_utc() + timedelta(seconds=seconds)).isoformat(timespec="seconds") if seconds else None
+                  raise_service_pause("facebook", f"Facebook /me/accounts HTTP 429: {response_text(response)}", resume_at=resume)
+              if response.status_code >= 500:
+                  raise_service_pause("facebook", f"Facebook /me/accounts HTTP {response.status_code}: {response_text(response)}")
+
+              if response.ok:
+                  # This is a User Access Token path. Validate the three permissions that
+                  # the Page publishing flow depends on before accepting the derived Page token.
+                  permissions = facebook_permissions_for_user(configured_token)
+                  required = {"pages_show_list", "pages_manage_posts", "pages_read_engagement"}
+                  missing = sorted(required - permissions)
+                  if missing:
+                      raise NonRetryableError(
+                          "Fresh Facebook User Access Token is missing required granted permissions: "
+                          + ", ".join(missing)
+                      )
+
+                  pages = response.json().get("data", [])
+                  target = next(
+                      (
+                          page
+                          for page in pages
+                          if str(page.get("id", "")).strip() == str(cfg["FACEBOOK_PAGE_ID"]).strip()
+                      ),
+                      None,
+                  )
+                  if target and str(target.get("access_token", "")).strip():
+                      cfg["FACEBOOK_PAGE_ACCESS_TOKEN"] = str(target["access_token"]).strip()
+                      print("Facebook Page token auto-resolved from User token:", target.get("name"), target.get("id"))
+                      tasks = target.get("tasks") or []
+                      if isinstance(tasks, list) and tasks:
+                          print("Facebook Page tasks available:", ", ".join(str(x) for x in tasks))
+                      validate_direct_page_token(cfg)
+                      return
+
+                  raise NonRetryableError(
+                      "Facebook User Access Token is valid, but the configured Page was not returned by /me/accounts "
+                      f"for Page ID {cfg['FACEBOOK_PAGE_ID']}"
+                  )
+
+              # The token may already be a Page Access Token. /me/accounts normally expects a
+              # User Access Token, so a failed /me/accounts call is not by itself fatal.
+              body = response_text(response)
+              lowered = body.lower()
+              if "\"code\":190" in lowered or "session has expired" in lowered or "invalid oauth" in lowered:
+                  raise NonRetryableError(
+                      "Facebook access token is expired or invalid. Generate a fresh User Access Token in Graph API Explorer "
+                      "and save it to the existing GitHub secret FACEBOOK_PAGE_ACCESS_TOKEN. "
+                      f"Meta response: {body[:1200]}"
+                  )
+
+              cfg["FACEBOOK_PAGE_ACCESS_TOKEN"] = configured_token
+              validate_direct_page_token(cfg)
+              print("Facebook token accepted directly as a Page Access Token")
+
+
+          def reopen_known_permission_failures(queue: list[dict[str, Any]]) -> bool:
+              """Requeue only definitive permission rejections that cannot have posted the Page item."""
+              changed = False
+              marker_a = "requires both pages_read_engagement and pages_manage_posts"
+              marker_b = "(#200)"
+              for item in queue:
+                  if item.get("status") != "failed":
+                      continue
+                  error = str(item.get("last_error", "")).lower()
+                  if marker_a in error or marker_b in error:
+                      item["status"] = "retry"
+                      item["next_attempt_at"] = ""
+                      item["last_error"] = (
+                          "Reopened after definitive Facebook Code 200 permission rejection; "
+                          "the worker will retry using the auto-resolved Page Access Token."
+                      )
+                      changed = True
+              return changed
           
           
           def facebook_already_posted_locally(state: dict[str, Any], item: dict[str, Any]) -> bool:
@@ -1642,8 +1783,12 @@ jobs:
 
               queue = load_facebook_queue()
               state = load_state()
-              validate_page_token(cfg)
-              startup_reconciled = False
+
+              # The existing GitHub secret is intentionally accepted as either a fresh User
+              # Access Token or a Page Access Token. A User token is converted automatically
+              # to the matching Page token before any publish call.
+              resolve_page_access_token(cfg)
+              startup_reconciled = reopen_known_permission_failures(queue)
 
               # Reconcile only from our own durable state. No Facebook feed/read endpoint is used.
               for item in queue:
