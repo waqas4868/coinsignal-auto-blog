@@ -5,11 +5,11 @@
     "summary": "NEAR Protocol rises nearly 80% in a week as NEAR Intents cumulative volume reaches $29.3B and expands privacy features, including Zcash swaps.",
     "article_url": "https://blogsdrip4u.blogspot.com/2026/09/near-protocol-jumps-80-weekly-as-near.html",
     "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/near-protocol-jumps-80-weekly-as-near-intents-volume-nears-30-billion-a380232311eb3d988d98.png",
-    "status": "failed",
+    "status": "retry",
     "attempts": 1,
     "created_at": "2026-09-21T04:25:05-07:00",
     "next_attempt_at": "",
-    "last_error": "Non-retryable Facebook auth/permission/parameter error: {\"error\":{\"message\":\"(#200) If posting to a group, requires app being installed in the group, and \\\\\\n          either publish_to_groups permission with user token, or both pages_read_engagement \\\\\\n          and pages_manage_posts permission with page token; If posting to a page, \\\\\\n          requires both pages_read_engagement and pages_manage_posts as an admin with \\\\\\n          sufficient administrative permission\",\"type\":\"OAuthException\",\"code\":200,\"fbtrace_id\":\"Afa3xgu7gSqDO4dWLKkd7iA\"}}"
+    "last_error": "Reopened after definitive Facebook Code 200 permission rejection; the worker will retry using the auto-resolved Page Access Token."
   },
   {
     "source_id": "6686efe8d004e844905e",
@@ -17,11 +17,11 @@
     "summary": "Strategy ends a two-week pause to acquire 950 Bitcoin for $75.7 million while deploying $174 million to repurchase its STRC preferred stock.",
     "article_url": "https://blogsdrip4u.blogspot.com/2026/09/strategy-resumes-bitcoin-purchases-with.html",
     "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/strategy-resumes-bitcoin-purchases-with-75-7m-buy-and-repurchases-strc-preferred-stock-6686efe8d004e844905e.png",
-    "status": "failed",
+    "status": "retry",
     "attempts": 1,
     "created_at": "2026-09-21T06:21:09-07:00",
     "next_attempt_at": "",
-    "last_error": "Non-retryable Facebook auth/permission/parameter error: {\"error\":{\"message\":\"(#200) If posting to a group, requires app being installed in the group, and \\\\\\n          either publish_to_groups permission with user token, or both pages_read_engagement \\\\\\n          and pages_manage_posts permission with page token; If posting to a page, \\\\\\n          requires both pages_read_engagement and pages_manage_posts as an admin with \\\\\\n          sufficient administrative permission\",\"type\":\"OAuthException\",\"code\":200,\"fbtrace_id\":\"AHN6TiKZMOa-wegbTMzSJV_\"}}"
+    "last_error": "Reopened after definitive Facebook Code 200 permission rejection; the worker will retry using the auto-resolved Page Access Token."
   },
   {
     "source_id": "b7351036093a8fa02535",
@@ -29,10 +29,10 @@
     "summary": "",
     "article_url": "https://blogsdrip4u.blogspot.com/2026/09/x-files-lawsuit-against-bitcoin-account.html",
     "image_url": "",
-    "status": "failed",
+    "status": "retry",
     "attempts": 1,
     "created_at": "2026-09-21T03:18:22-07:00",
     "next_attempt_at": "",
-    "last_error": "Non-retryable Facebook auth/permission/parameter error: {\"error\":{\"message\":\"(#200) If posting to a group, requires app being installed in the group, and \\\\\\n          either publish_to_groups permission with user token, or both pages_read_engagement \\\\\\n          and pages_manage_posts permission with page token; If posting to a page, \\\\\\n          requires both pages_read_engagement and pages_manage_posts as an admin with \\\\\\n          sufficient administrative permission\",\"type\":\"OAuthException\",\"code\":200,\"fbtrace_id\":\"ADiuGkZLgza4CkpLhY7UDGV\"}}"
+    "last_error": "Reopened after definitive Facebook Code 200 permission rejection; the worker will retry using the auto-resolved Page Access Token."
   }
 ]
