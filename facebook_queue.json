@@ -70,5 +70,17 @@
     "created_at": "2026-09-21T13:51:26-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "295f393e35560d39d5e2",
+    "title": "Ondo Finance Introduces In-Kind Conversion for Tokenized Stocks and ETFs",
+    "summary": "Ondo Finance enables approved institutions to mint and redeem tokenized stocks and ETFs using underlying securities, bypassing cash-conversion friction.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/ondo-finance-introduces-in-kind.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/ondo-finance-introduces-in-kind-conversion-for-tokenized-stocks-and-etfs-295f393e35560d39d5e2.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-21T16:50:15-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
