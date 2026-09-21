@@ -1,13 +1,15 @@
 {
   "date": "2026-09-21",
-  "count": 2,
+  "count": 3,
   "posted_source_ids": [
     "b7351036093a8fa02535",
-    "a380232311eb3d988d98"
+    "a380232311eb3d988d98",
+    "6686efe8d004e844905e"
   ],
   "posted_urls": [
     "https://blogsdrip4u.blogspot.com/2026/09/x-files-lawsuit-against-bitcoin-account.html",
-    "https://blogsdrip4u.blogspot.com/2026/09/near-protocol-jumps-80-weekly-as-near.html"
+    "https://blogsdrip4u.blogspot.com/2026/09/near-protocol-jumps-80-weekly-as-near.html",
+    "https://blogsdrip4u.blogspot.com/2026/09/strategy-resumes-bitcoin-purchases-with.html"
   ],
   "posts": [
     {
@@ -23,6 +25,13 @@
       "post_id": "1230937780113012_122104011375480923",
       "recovered": false,
       "time": "2026-09-21T14:16:07.896306+00:00"
+    },
+    {
+      "source_id": "6686efe8d004e844905e",
+      "url": "https://blogsdrip4u.blogspot.com/2026/09/strategy-resumes-bitcoin-purchases-with.html",
+      "post_id": "1230937780113012_122104011441480923",
+      "recovered": false,
+      "time": "2026-09-21T14:16:15.907649+00:00"
     }
   ]
 }
