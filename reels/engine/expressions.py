@@ -83,22 +83,22 @@ EXPRESSIONS: dict[str, Expression] = {
 }
 
 
-def apply_expression(elements_by_id: dict[str, ET.Element], expression_name: str) -> None:
+def apply_expression(elements_by_id: dict[str, ET.Element], expression_name: str, character: str = "alex") -> None:
     if expression_name not in EXPRESSIONS:
         raise ValueError(f"Unknown expression {expression_name!r}. Known: {sorted(EXPRESSIONS)}")
     expr = EXPRESSIONS[expression_name]
 
-    for eyebrow_id, extra_transform in (
-        ("alex-left-eyebrow", expr.left_eyebrow),
-        ("alex-right-eyebrow", expr.right_eyebrow),
+    for eyebrow_suffix, extra_transform in (
+        ("left-eyebrow", expr.left_eyebrow),
+        ("right-eyebrow", expr.right_eyebrow),
     ):
-        el = elements_by_id[eyebrow_id]
+        el = elements_by_id[f"{character}-{eyebrow_suffix}"]
         rest = el.get("data-rest-transform") or el.get("transform", "")
         el.set("data-rest-transform", rest)
         el.set("transform", f"{rest} {extra_transform}".strip())
 
-    for eye_id in ("alex-left-eye", "alex-right-eye"):
-        el = elements_by_id[eye_id]
+    for eye_suffix in ("left-eye", "right-eye"):
+        el = elements_by_id[f"{character}-{eye_suffix}"]
         rest = el.get("data-rest-transform") or el.get("transform", "")
         el.set("data-rest-transform", rest)
         scale_part = "" if expr.eye_scale == 1.0 else f" scale({expr.eye_scale})"
@@ -110,8 +110,8 @@ def apply_expression(elements_by_id: dict[str, ET.Element], expression_name: str
             eye_open_el.set("display", "none" if expr.eyes_closed else "inline")
             eye_closed_el.set("display", "inline" if expr.eyes_closed else "none")
 
-    mouth_group = elements_by_id["alex-mouth"]
+    mouth_group = elements_by_id[f"{character}-mouth"]
     mouth_path = mouth_group.find(f"{{{SVG_NS}}}path")
     if mouth_path is None:
-        raise ValueError("alex-mouth group has no child <path> to morph")
+        raise ValueError(f"{character}-mouth group has no child <path> to morph")
     mouth_path.set("d", MOUTH_SHAPES[expr.mouth])

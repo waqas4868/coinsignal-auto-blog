@@ -47,13 +47,14 @@ class Performance:
         apply_state(self.rig, perf_input.state)
 
         # 2. Base procedural motion - additive nudges only.
-        self.rig.nudge_angle("alex-torso", breathing_torso_angle(t))
-        self.rig.nudge_angle("alex-pelvis", weight_shift_pelvis_angle(t))
+        c = self.rig.character
+        self.rig.nudge_angle(f"{c}-torso", breathing_torso_angle(t))
+        self.rig.nudge_angle(f"{c}-pelvis", weight_shift_pelvis_angle(t))
 
         # 3. Gaze - additive head nudge + eye offset (eyes already have a
         # transform from step 1's expression call, so this stacks correctly).
         gaze = compute_gaze(perf_input.gaze_target)
-        self.rig.nudge_angle("alex-head", gaze.head_extra_deg)
+        self.rig.nudge_angle(f"{c}-head", gaze.head_extra_deg)
         self.rig.add_eye_offset(gaze.eye_offset_x)
 
         # 4. Blink - overrides eyes-closed only while actively blinking;

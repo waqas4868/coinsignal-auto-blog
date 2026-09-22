@@ -2,6 +2,11 @@
 rotate(..)" onto each named joint <g>, using SVG's native nested-transform
 composition as the forward-kinematics engine (see alex.svg's docstring).
 
+Character-agnostic (Phase 6 refactor): Rig takes a `character` id
+("alex"/"jake") and derives its joint limits/IK chains/element ids from it
+via joints.py's for_character() helpers, instead of hardcoding "alex-*".
+Both characters share this exact class - only their SVG artwork differs.
+
 Uses the standard library's xml.etree.ElementTree rather than adding a new
 dependency (lxml) for what's still prototype-phase code - see STATUS.md.
 """
@@ -13,7 +18,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from expressions import apply_expression, MOUTH_SHAPES
-from joints import IK_CHAINS, JOINT_LIMITS, clamp_angle
+from joints import clamp_angle, ik_chains_for, joint_limits_for
 
 SVG_NS = "http://www.w3.org/2000/svg"
 ET.register_namespace("", SVG_NS)
@@ -22,7 +27,11 @@ _TRANSLATE_RE = re.compile(r"translate\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)")
 
 
 class Rig:
-    def __init__(self, svg_path: Path):
+    def __init__(self, svg_path: Path, character: str = "alex"):
+        self.character = character
+        self.joint_limits = joint_limits_for(character)
+        self.ik_chains = ik_chains_for(character)
+
         self.svg_path = Path(svg_path)
         self.tree = ET.parse(self.svg_path)
         self.root = self.tree.getroot()
@@ -32,20 +41,23 @@ class Rig:
         # Rest-pose local (tx, ty) per joint, read once from the SVG itself -
         # the SVG file stays the single source of truth for rest geometry.
         self._rest_offset: dict[str, tuple[float, float]] = {}
-        for joint_id in JOINT_LIMITS:
+        for joint_id in self.joint_limits:
             el = self._elements.get(joint_id)
             if el is None:
                 raise ValueError(f"Joint {joint_id!r} not found in {self.svg_path}")
             match = _TRANSLATE_RE.search(el.get("transform", ""))
             self._rest_offset[joint_id] = (float(match.group(1)), float(match.group(2))) if match else (0.0, 0.0)
 
-        self.pose: dict[str, float] = {joint_id: 0.0 for joint_id in JOINT_LIMITS}
+        self.pose: dict[str, float] = {joint_id: 0.0 for joint_id in self.joint_limits}
         self.clamped_this_pose: list[str] = []
 
+    def _id(self, suffix: str) -> str:
+        return f"{self.character}-{suffix}"
+
     def set_angle(self, joint_id: str, degrees: float) -> float:
-        if joint_id not in JOINT_LIMITS:
-            raise ValueError(f"Unknown joint {joint_id!r}")
-        clamped, was_clamped = clamp_angle(joint_id, degrees)
+        if joint_id not in self.joint_limits:
+            raise ValueError(f"Unknown joint {joint_id!r} for character {self.character!r}")
+        clamped, was_clamped = clamp_angle(self.joint_limits, joint_id, degrees)
         if was_clamped:
             self.clamped_this_pose.append(
                 f"{joint_id}: requested {degrees:.1f} deg, clamped to {clamped:.1f} deg"
@@ -54,7 +66,7 @@ class Rig:
         return clamped
 
     def reset_pose(self) -> None:
-        self.pose = {joint_id: 0.0 for joint_id in JOINT_LIMITS}
+        self.pose = {joint_id: 0.0 for joint_id in self.joint_limits}
         self.clamped_this_pose = []
 
     def point_to(self, side: str, target_local: tuple[float, float], upper_len: float, lower_len: float) -> None:
@@ -64,9 +76,9 @@ class Rig:
         unreachable target still yields a valid (not impossible) pose.
         """
         chain_key = f"{side}-arm"
-        if chain_key not in IK_CHAINS:
+        if chain_key not in self.ik_chains:
             raise ValueError(f"No IK chain defined for {chain_key!r}")
-        upper_id, lower_id, _hand_id = IK_CHAINS[chain_key]
+        upper_id, lower_id, _hand_id = self.ik_chains[chain_key]
         shoulder_x, shoulder_y = self._rest_offset[upper_id]
 
         dx = target_local[0] - shoulder_x
@@ -80,7 +92,7 @@ class Rig:
         # solutions (elbow-up / elbow-down) - verified numerically via
         # forward-kinematics (see conversation) that side_sign=+1 (left) /
         # -1 (right), applied to BOTH terms together, is the solution
-        # consistent with each side's forearm bend direction in JOINT_LIMITS
+        # consistent with each side's forearm bend direction in joints.py
         # (left forearm bends positive, right bends negative). Using the
         # wrong pairing still finds *a* pose but the hand misses the target
         # by roughly double the reach distance - confirmed by the same check.
@@ -114,7 +126,7 @@ class Rig:
         return self.tree
 
     def set_expression(self, expression_name: str) -> None:
-        apply_expression(self._elements, expression_name)
+        apply_expression(self._elements, expression_name, character=self.character)
 
     # --- Layering primitives (Phase 5): each ADDS to or OVERRIDES one
     # specific channel without touching the others, so multiple concerns
@@ -131,8 +143,8 @@ class Rig:
         """Appends a small extra translate to each eye's CURRENT transform
         (whatever set_expression already produced) - must be called after
         set_expression() in the composition order, not before."""
-        for eye_id in ("alex-left-eye", "alex-right-eye"):
-            el = self._elements[eye_id]
+        for suffix in ("left-eye", "right-eye"):
+            el = self._elements[self._id(suffix)]
             current = el.get("transform", "")
             el.set("transform", f"{current} translate({dx:.2f},0)".strip())
 
@@ -142,8 +154,8 @@ class Rig:
         "laughing") isn't fought by an inactive blink."""
         if not closed:
             return
-        for eye_id in ("alex-left-eye", "alex-right-eye"):
-            el = self._elements[eye_id]
+        for suffix in ("left-eye", "right-eye"):
+            el = self._elements[self._id(suffix)]
             open_el = el.find(f"{{{SVG_NS}}}circle[@class='eye-open']")
             closed_el = el.find(f"{{{SVG_NS}}}path[@class='eye-closed']")
             if open_el is not None and closed_el is not None:
@@ -153,7 +165,7 @@ class Rig:
     def override_mouth(self, shape_key: str) -> None:
         """Talk override: replaces whatever set_expression put in the mouth
         path with a viseme shape, independent of eyebrows/eyes."""
-        mouth_group = self._elements["alex-mouth"]
+        mouth_group = self._elements[self._id("mouth")]
         mouth_path = mouth_group.find(f"{{{SVG_NS}}}path")
         mouth_path.set("d", MOUTH_SHAPES[shape_key])
 

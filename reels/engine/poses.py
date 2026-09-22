@@ -1,7 +1,11 @@
-"""Reusable BODY poses: named dicts of {joint_id: degrees}, applied through
-Rig.set_angle() so every pose automatically respects the Phase 3 angle
-limits - a pose can request an unreasonable angle and it will clamp rather
-than break, same as any manual set_angle() call.
+"""Reusable BODY poses: named dicts of {joint_suffix: degrees}, applied
+through Rig.set_angle() so every pose automatically respects the Phase 3
+angle limits - a pose can request an unreasonable angle and it will clamp
+rather than break, same as any manual set_angle() call.
+
+Character-agnostic (Phase 6 refactor): keyed by joint SUFFIX ("head", not
+"alex-head"), prefixed with rig.character at apply time - the same pose
+library works for Alex or Jake since they share rig topology.
 
 Only joints that differ from rest (0 deg) need to be listed - anything
 omitted stays at rest.
@@ -15,53 +19,53 @@ POSES: dict[str, dict[str, float]] = {
         # Matches the IK-verified point_to() result for a chest-height
         # forward-right target (reels/engine/rig.py Rig.point_to) baked in
         # as a fixed reusable pose - avoids recomputing IK for the common case.
-        "alex-right-upper-arm": -5.8,
-        "alex-right-forearm": -91.5,
-        "alex-head": -8,
+        "right-upper-arm": -5.8,
+        "right-forearm": -91.5,
+        "head": -8,
     },
     "point_left": {
-        "alex-left-upper-arm": 5.8,
-        "alex-left-forearm": 91.5,
-        "alex-head": 8,
+        "left-upper-arm": 5.8,
+        "left-forearm": 91.5,
+        "head": 8,
     },
 
     "wave": {
-        "alex-left-upper-arm": 110,
-        "alex-left-forearm": 60,
-        "alex-head": 10,
+        "left-upper-arm": 110,
+        "left-forearm": 60,
+        "head": 10,
     },
 
     "shrug": {
-        "alex-left-upper-arm": 70,
-        "alex-left-forearm": 100,
-        "alex-right-upper-arm": -70,
-        "alex-right-forearm": -100,
-        "alex-torso": 4,
+        "left-upper-arm": 70,
+        "left-forearm": 100,
+        "right-upper-arm": -70,
+        "right-forearm": -100,
+        "torso": 4,
     },
 
     "shock_recoil": {
-        "alex-head": -12,
-        "alex-torso": -8,
-        "alex-left-upper-arm": 55,
-        "alex-left-forearm": 40,
-        "alex-right-upper-arm": -55,
-        "alex-right-forearm": -40,
+        "head": -12,
+        "torso": -8,
+        "left-upper-arm": 55,
+        "left-forearm": 40,
+        "right-upper-arm": -55,
+        "right-forearm": -40,
     },
 
     "angry_lean": {
-        "alex-torso": 10,
-        "alex-head": -6,
-        "alex-left-upper-arm": 20,
-        "alex-right-upper-arm": -20,
+        "torso": 10,
+        "head": -6,
+        "left-upper-arm": 20,
+        "right-upper-arm": -20,
     },
 
     "turn_toward_left": {
-        "alex-head": 30,
-        "alex-torso": 12,
+        "head": 30,
+        "torso": 12,
     },
     "turn_toward_right": {
-        "alex-head": -30,
-        "alex-torso": -12,
+        "head": -30,
+        "torso": -12,
     },
 
     "walk_contact": {
@@ -69,10 +73,10 @@ POSES: dict[str, dict[str, float]] = {
         # from the WALK cycle (contact -> down -> passing -> up -> contact)
         # described in the spec; the full cycle is a Phase 5/7 concern once
         # timing/interpolation exists, this is just the reusable key pose.
-        "alex-left-thigh": -35,
-        "alex-right-thigh": 35,
-        "alex-left-upper-arm": -25,
-        "alex-right-upper-arm": 25,
+        "left-thigh": -35,
+        "right-thigh": 35,
+        "left-upper-arm": -25,
+        "right-upper-arm": 25,
     },
 }
 
@@ -83,6 +87,6 @@ def apply_pose(rig, pose_name: str) -> list[str]:
     if pose_name not in POSES:
         raise ValueError(f"Unknown pose {pose_name!r}. Known poses: {sorted(POSES)}")
     rig.clamped_this_pose = []
-    for joint_id, angle in POSES[pose_name].items():
-        rig.set_angle(joint_id, angle)
+    for suffix, angle in POSES[pose_name].items():
+        rig.set_angle(f"{rig.character}-{suffix}", angle)
     return list(rig.clamped_this_pose)

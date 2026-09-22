@@ -1,10 +1,12 @@
-"""Joint definitions for the Alex/Jake rig: hierarchy, rotation axis, and
-angle limits ("the system must prevent obviously impossible poses").
+"""Joint definitions: hierarchy, rotation axis, and angle limits ("the
+system must prevent obviously impossible poses").
 
-Parent-child structure matches the SVG nesting exactly (see
-reels/characters/alex/alex.svg) - this module doesn't redefine the
-hierarchy, it annotates it with what a rig actually needs beyond raw SVG
-geometry: which joints rotate, and how far.
+Character-agnostic (Phase 6 refactor): defined once by SUFFIX
+("left-upper-arm", not "alex-left-upper-arm") and instantiated per
+character via for_character(). Both Alex and Jake share this exact rig
+topology - only their SVG artwork differs - which is the actual point of
+"one animation engine + reusable character states" rather than a separate
+copy of this file per character.
 
 Angle sign convention: 0 degrees = rest pose (as drawn in the SVG).
 Positive degrees = clockwise on screen (standard SVG rotate() direction).
@@ -24,53 +26,69 @@ class JointLimit:
     max_deg: float
 
 
-# Angle ranges are deliberately conservative for a simple stick/cutout
-# character - the goal is "prevents obviously impossible poses", not
-# biomechanically precise human range of motion.
-JOINT_LIMITS: dict[str, JointLimit] = {
-    j.joint_id: j
-    for j in [
-        JointLimit("alex-pelvis", None, -10, 10),
-        JointLimit("alex-torso", "alex-pelvis", -20, 20),
-        JointLimit("alex-neck", "alex-torso", -25, 25),
-        JointLimit("alex-head", "alex-neck", -45, 45),
+# (suffix, parent_suffix_or_None, min_deg, max_deg)
+_JOINT_SUFFIXES: list[tuple[str, str | None, float, float]] = [
+    ("pelvis", None, -10, 10),
+    ("torso", "pelvis", -20, 20),
+    ("neck", "torso", -25, 25),
+    ("head", "neck", -45, 45),
 
-        # Verified numerically (see conversation): for a limb hanging straight
-        # down at rest, POSITIVE rotate() swings its endpoint toward
-        # screen-left, NEGATIVE toward screen-right. The left shoulder sits
-        # at screen-left, so POSITIVE = swinging further outward/away from
-        # the body (large natural range, e.g. raising the arm up/out); NEGATIVE
-        # = swinging inward across the body (small range, anatomically
-        # limited). Mirrored for the right arm.
-        JointLimit("alex-left-upper-arm", "alex-torso", -60, 150),
-        JointLimit("alex-left-forearm", "alex-left-upper-arm", 0, 150),
-        JointLimit("alex-left-hand", "alex-left-forearm", -40, 40),
-        JointLimit("alex-right-upper-arm", "alex-torso", -150, 60),
-        JointLimit("alex-right-forearm", "alex-right-upper-arm", -150, 0),
-        JointLimit("alex-right-hand", "alex-right-forearm", -40, 40),
+    # Verified numerically (see conversation): for a limb hanging straight
+    # down at rest, POSITIVE rotate() swings its endpoint toward
+    # screen-left, NEGATIVE toward screen-right. The left shoulder sits
+    # at screen-left, so POSITIVE = swinging further outward/away from
+    # the body (large natural range, e.g. raising the arm up/out); NEGATIVE
+    # = swinging inward across the body (small range, anatomically
+    # limited). Mirrored for the right arm.
+    ("left-upper-arm", "torso", -60, 150),
+    ("left-forearm", "left-upper-arm", 0, 150),
+    ("left-hand", "left-forearm", -40, 40),
+    ("right-upper-arm", "torso", -150, 60),
+    ("right-forearm", "right-upper-arm", -150, 0),
+    ("right-hand", "right-forearm", -40, 40),
 
-        JointLimit("alex-left-thigh", "alex-pelvis", -60, 90),
-        JointLimit("alex-left-shin", "alex-left-thigh", 0, 140),
-        JointLimit("alex-left-foot", "alex-left-shin", -30, 30),
-        JointLimit("alex-right-thigh", "alex-pelvis", -90, 60),
-        JointLimit("alex-right-shin", "alex-right-thigh", -140, 0),
-        JointLimit("alex-right-foot", "alex-right-shin", -30, 30),
-    ]
-}
+    ("left-thigh", "pelvis", -60, 90),
+    ("left-shin", "left-thigh", 0, 140),
+    ("left-foot", "left-shin", -30, 30),
+    ("right-thigh", "pelvis", -90, 60),
+    ("right-shin", "right-thigh", -140, 0),
+    ("right-foot", "right-shin", -30, 30),
+]
 
-# Two-segment chains eligible for IK (proximal, distal, end-effector) -
-# used for point_to()/reach-style poses. Not every joint chain needs IK
-# (per the spec: "Do not use IK everywhere").
-IK_CHAINS: dict[str, tuple[str, str, str]] = {
-    "left-arm": ("alex-left-upper-arm", "alex-left-forearm", "alex-left-hand"),
-    "right-arm": ("alex-right-upper-arm", "alex-right-forearm", "alex-right-hand"),
-}
+# (chain_key_suffix, upper_suffix, lower_suffix, hand_suffix)
+_IK_CHAIN_SUFFIXES: list[tuple[str, str, str, str]] = [
+    ("left-arm", "left-upper-arm", "left-forearm", "left-hand"),
+    ("right-arm", "right-upper-arm", "right-forearm", "right-hand"),
+]
 
 
-def clamp_angle(joint_id: str, degrees: float) -> tuple[float, bool]:
+def joint_limits_for(character: str) -> dict[str, JointLimit]:
+    return {
+        f"{character}-{suffix}": JointLimit(
+            f"{character}-{suffix}",
+            f"{character}-{parent}" if parent else None,
+            min_deg, max_deg,
+        )
+        for suffix, parent, min_deg, max_deg in _JOINT_SUFFIXES
+    }
+
+
+def ik_chains_for(character: str) -> dict[str, tuple[str, str, str]]:
+    return {
+        chain_key: (f"{character}-{upper}", f"{character}-{lower}", f"{character}-{hand}")
+        for chain_key, upper, lower, hand in _IK_CHAIN_SUFFIXES
+    }
+
+
+def clamp_angle(joint_limits: dict[str, JointLimit], joint_id: str, degrees: float) -> tuple[float, bool]:
     """Returns (clamped_degrees, was_clamped)."""
-    limit = JOINT_LIMITS.get(joint_id)
+    limit = joint_limits.get(joint_id)
     if limit is None:
         return degrees, False
     clamped = max(limit.min_deg, min(limit.max_deg, degrees))
     return clamped, clamped != degrees
+
+
+# Kept for any code that still wants "the" joint list independent of a
+# specific character (e.g. iterating suffixes) - not id-prefixed.
+JOINT_SUFFIXES: list[str] = [s for s, _, _, _ in _JOINT_SUFFIXES]
