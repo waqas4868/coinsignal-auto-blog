@@ -54,9 +54,9 @@
     "article_source_id": "24b38411fad48033756e",
     "content_type": "funny",
     "created_at": "2026-09-22T21:30:48+00:00",
-    "state": "video_ready",
+    "state": "failed",
     "facebook_video_id": "",
-    "updated_at": "2026-09-22T21:33:57+00:00",
-    "error_reason": ""
+    "updated_at": "2026-09-22T21:34:01+00:00",
+    "error_reason": "Reels start failed HTTP 400: {\"error\":{\"message\":\"Error validating access token: Session has expired on Tuesday, 22-Sep-26 03:00:00 PDT. The current time is Tuesday, 22-Sep-26 14:34:00 PDT.\",\"type\":\"OAuthException\",\"code\":190,\"error_subcode\":463,\"fbtrace_id\":\"Atys978ANAfNIW08kewQZ80\"}}"
   }
 ]
