@@ -1,19 +1,21 @@
 {
   "date": "2026-09-22",
-  "count": 2,
+  "count": 3,
   "posted_source_ids": [
     "b7351036093a8fa02535",
     "a380232311eb3d988d98",
     "6686efe8d004e844905e",
     "72da260becdf20ed9200",
-    "5de8785a440d4eeb5362"
+    "5de8785a440d4eeb5362",
+    "92c18c3f2194c29c17ad"
   ],
   "posted_urls": [
     "https://blogsdrip4u.blogspot.com/2026/09/x-files-lawsuit-against-bitcoin-account.html",
     "https://blogsdrip4u.blogspot.com/2026/09/near-protocol-jumps-80-weekly-as-near.html",
     "https://blogsdrip4u.blogspot.com/2026/09/strategy-resumes-bitcoin-purchases-with.html",
     "https://blogsdrip4u.blogspot.com/2026/09/clarity-act-stalls-as-coinbase-faces.html",
-    "https://blogsdrip4u.blogspot.com/2026/09/crypto-pac-fairshake-spends-30m.html"
+    "https://blogsdrip4u.blogspot.com/2026/09/crypto-pac-fairshake-spends-30m.html",
+    "https://blogsdrip4u.blogspot.com/2026/09/saudi-arabia-exits-china-backed-mbridge.html"
   ],
   "posts": [
     {
@@ -50,6 +52,13 @@
       "post_id": "1230937780113012_122104733493480923",
       "recovered": false,
       "time": "2026-09-22T06:53:13.844106+00:00"
+    },
+    {
+      "source_id": "92c18c3f2194c29c17ad",
+      "url": "https://blogsdrip4u.blogspot.com/2026/09/saudi-arabia-exits-china-backed-mbridge.html",
+      "post_id": "1230937780113012_122104733715480923",
+      "recovered": false,
+      "time": "2026-09-22T06:53:26.393098+00:00"
     }
   ]
 }
