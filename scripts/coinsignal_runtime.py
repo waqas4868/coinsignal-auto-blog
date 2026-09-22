@@ -1,0 +1,2031 @@
+import base64
+import hashlib
+import html
+import json
+import os
+import re
+import subprocess
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
+
+import nh3
+import requests
+import feedparser
+from huggingface_hub import InferenceClient
+
+CODE_VERSION = "2026-09-22-EXTRACTED-SCRIPT-PINNED-DEPS-QUOTA-CHECKPOINT-SANITIZER-FIX-13"
+PKT = ZoneInfo("Asia/Karachi")
+RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
+MAX_RETRY_WAIT = 120
+
+
+class HardQuotaError(RuntimeError):
+    """A quota exhaustion condition that should stop this run successfully."""
+    pass
+
+
+class ServicePauseError(RuntimeError):
+    """A service-side rate-limit/temporary pause that should stop this run successfully."""
+    pass
+
+
+class NonRetryableError(RuntimeError):
+    pass
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_pkt() -> datetime:
+    return datetime.now(PKT)
+
+
+def pkt_date() -> str:
+    return now_pkt().strftime("%Y-%m-%d")
+
+
+def iso_now() -> str:
+    return now_utc().isoformat(timespec="seconds")
+
+
+def normalize_url(value: str | None) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    try:
+        parts = urlsplit(value)
+        ignored = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+        query = [
+            (k, v)
+            for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if not k.lower().startswith("utm_") and k.lower() not in ignored
+        ]
+        return urlunsplit(
+            (
+                parts.scheme.lower(),
+                parts.netloc.lower(),
+                parts.path.rstrip("/"),
+                urlencode(query),
+                "",
+            )
+        )
+    except Exception:
+        return value.split("?", 1)[0].rstrip("/")
+
+
+def source_id(source_url: str) -> str:
+    return hashlib.sha256(normalize_url(source_url).encode("utf-8")).hexdigest()[:20]
+
+
+def title_fingerprint(title: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def read_json(path: Path | str, default: Any) -> Any:
+    path = Path(path)
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"STATE READ WARNING {path}: {exc}")
+    return default
+
+
+def write_json(path: Path | str, value: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def require_env(*names: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    missing: list[str] = []
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            missing.append(name)
+        else:
+            values[name] = value
+    if missing:
+        raise NonRetryableError("Missing required GitHub secrets/variables: " + ", ".join(missing))
+    return values
+
+
+def response_text(response: requests.Response | None, limit: int = 4000) -> str:
+    try:
+        return response.text[:limit]
+    except Exception:
+        return ""
+
+
+def is_hard_quota(response: requests.Response | None = None, text: str = "") -> bool:
+    body = response_text(response).lower() if response is not None else ""
+    value = f"{body} {str(text or '').lower()}"
+    # Union of tokens seen across every service this pipeline calls (Google/Gemini,
+    # Blogger, Hugging Face, and Meta's Graph API) - kept in one place so RSS,
+    # Gemini, Blogger, image generation, and Facebook all share one quota heuristic
+    # instead of maintaining separate, drifting copies.
+    explicit = (
+        "quota_exceeded",
+        "quota exceeded",
+        "daily quota",
+        "daily limit exceeded",
+        "daily_limit_exceeded",
+        "dailylimitexceeded",
+        "per day quota",
+        "per day",
+        "perdayperproject",
+        "perdaypermodel",
+        "generate_requests_per_day",
+        "generaterequestsperday",
+        "quota metric.*perday",
+        "quota exhausted for the day",
+        "monthly quota",
+        "monthly limit exceeded",
+        "usage limit exceeded",
+    )
+    if any(token in value for token in explicit):
+        return True
+    if "quota exceeded for quota metric" in value and any(
+        token in value for token in ("day", "daily", "month", "monthly")
+    ):
+        return True
+    try:
+        payload = response.json() if response is not None else {}
+        error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        status = str(error.get("status", "")).lower()
+        if status == "quota_exceeded":
+            return True
+        details = error.get("details", []) if isinstance(error, dict) else []
+        for detail in details if isinstance(details, list) else []:
+            raw = json.dumps(detail, ensure_ascii=False).lower()
+            if any(token in raw for token in ("perday", "per day", "daily", "monthly")) and "quota" in raw:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def next_pacific_midnight_utc_iso() -> str:
+    pacific = now_utc().astimezone(PACIFIC)
+    tomorrow = pacific.date() + timedelta(days=1)
+    next_midnight = datetime(
+        tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, 0, tzinfo=PACIFIC
+    )
+    return next_midnight.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def default_cooldown_resume_at(hours: int = 24) -> str:
+    """Fallback resume time for services with no published quota-reset schedule.
+
+    Every raise_hard_quota() call must supply a resume_at, or active_service_pause()
+    silently treats the pause as a one-run-only audit record and the paused service
+    gets retried again on the very next scheduled run. RSS/image/Facebook don't
+    publish a fixed daily reset boundary the way Google Cloud quotas do, so they use
+    this fixed cooldown instead of next_pacific_midnight_utc_iso().
+    """
+    return (now_utc() + timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+def parse_iso_datetime(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+QUOTA_STATE = Path("coinsignal_quota_state.json")
+PUBLISHER_INFLIGHT = Path("publisher_inflight.json")
+PACIFIC = ZoneInfo("America/Los_Angeles")
+
+
+def quota_state() -> dict[str, Any]:
+    raw = read_json(QUOTA_STATE, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    services = raw.get("services", {})
+    if not isinstance(services, dict):
+        services = {}
+    return {"version": 1, "updated_at": raw.get("updated_at", ""), "services": services}
+
+
+def _best_effort_persist_quota_state(message: str) -> None:
+    try:
+        write_json(QUOTA_STATE, quota_state())
+        configure_git()
+        branch = os.environ.get("GITHUB_REF_NAME", "main").strip() or "main"
+        ensure_branch()
+        git_commit_push_with_retry([str(QUOTA_STATE)], message, branch)
+    except Exception as exc:
+        # The caller must still stop the current run even when Git persistence is unavailable.
+        print("Quota-state Git persistence warning:", exc)
+
+
+def clear_service_pause(service: str) -> None:
+    state = quota_state()
+    if service in state["services"]:
+        state["services"].pop(service, None)
+        state["updated_at"] = iso_now()
+        write_json(QUOTA_STATE, state)
+
+
+def set_service_pause(
+    service: str,
+    reason: str,
+    *,
+    resume_at: str | None = None,
+    hard_quota: bool = False,
+) -> None:
+    state = quota_state()
+    state["updated_at"] = iso_now()
+    state["services"][service] = {
+        "status": "paused",
+        "hard_quota": bool(hard_quota),
+        "reason": str(reason)[:2000],
+        "detected_at": iso_now(),
+        "resume_at": resume_at or "",
+    }
+    write_json(QUOTA_STATE, state)
+    _best_effort_persist_quota_state(f"Record {service} service pause")
+
+
+def active_service_pause(service: str) -> dict[str, Any] | None:
+    state = quota_state()
+    entry = state["services"].get(service)
+    if not isinstance(entry, dict):
+        return None
+    resume_at = str(entry.get("resume_at", "")).strip()
+    if resume_at:
+        parsed = parse_iso_datetime(resume_at)
+        if parsed is not None and now_utc() >= parsed:
+            state["services"].pop(service, None)
+            state["updated_at"] = iso_now()
+            write_json(QUOTA_STATE, state)
+            return None
+    # When no reset time is known, the pause is only an audit record for the
+    # current run. The next scheduled run is allowed to retry the service.
+    if not resume_at:
+        return None
+    return entry
+
+
+def enforce_service_pause(service: str) -> None:
+    entry = active_service_pause(service)
+    if not entry:
+        return
+    resume_at = str(entry.get("resume_at", "")).strip()
+    message = f"{service} is paused from a previous service/quota event"
+    if resume_at:
+        message += f" until {resume_at}"
+    if bool(entry.get("hard_quota")):
+        raise HardQuotaError(message)
+    raise ServicePauseError(message)
+
+
+def raise_hard_quota(service: str, reason: str, *, resume_at: str | None = None) -> None:
+    set_service_pause(service, reason, resume_at=resume_at, hard_quota=True)
+    raise HardQuotaError(f"{service} hard quota: {reason}")
+
+
+def raise_service_pause(service: str, reason: str, *, resume_at: str | None = None) -> None:
+    set_service_pause(service, reason, resume_at=resume_at, hard_quota=False)
+    raise ServicePauseError(f"{service} paused: {reason}")
+
+
+def exception_response(exc: Exception) -> Any | None:
+    candidate = getattr(exc, "response", None)
+    if candidate is not None and hasattr(candidate, "status_code"):
+        return candidate
+    return None
+
+
+def rate_limit_reset_seconds(response: Any | None) -> int | None:
+    if response is None:
+        return None
+    try:
+        header = response.headers.get("RateLimit", "")
+        match = re.search(r"(?:^|[;|,])\s*t=(\d+)", header)
+        if match:
+            return max(1, min(int(match.group(1)), MAX_RETRY_WAIT))
+    except Exception:
+        pass
+    return retry_after_seconds(response)
+
+
+def retry_after_seconds(response: requests.Response | None) -> int | None:
+    if response is None:
+        return None
+    header = response.headers.get("Retry-After")
+    if header:
+        try:
+            return max(1, min(int(float(header)), MAX_RETRY_WAIT))
+        except Exception:
+            pass
+    try:
+        payload = response.json()
+        details = payload.get("error", {}).get("details", [])
+        for detail in details:
+            if str(detail.get("@type", "")).endswith("RetryInfo"):
+                raw = str(detail.get("retryDelay", ""))
+                if raw.endswith("s"):
+                    return max(1, min(int(float(raw[:-1])), MAX_RETRY_WAIT))
+    except Exception:
+        pass
+    return None
+
+
+def backoff_seconds(attempt: int, response: requests.Response | None = None) -> int:
+    hinted = retry_after_seconds(response)
+    if hinted is not None:
+        return hinted
+    ladder = [5, 10, 20, 30, 60, 90, 120]
+    return ladder[min(max(attempt - 1, 0), len(ladder) - 1)]
+
+
+def configure_git() -> None:
+    subprocess.run(["git", "config", "user.name", "CoinSignal Bot"], check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "coinsignal-bot@users.noreply.github.com"],
+        check=True,
+    )
+
+
+def ensure_branch() -> str:
+    branch = os.environ.get("GITHUB_REF_NAME", "main").strip() or "main"
+    result = subprocess.run(["git", "switch", branch], capture_output=True, text=True)
+    if result.returncode != 0:
+        result = subprocess.run(["git", "checkout", "-B", branch], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Could not switch to branch {branch}: {result.stderr[:2000]}")
+    return branch
+
+
+def git_sync_after_local_commit(branch: str) -> None:
+    # IMPORTANT: the caller must commit local workflow-generated changes
+    # before rebasing. Rebasing first fails when tracked state files are
+    # modified but unstaged (the exact failure seen in production).
+    subprocess.run(["git", "fetch", "origin", branch], check=True)
+    result = subprocess.run(["git", "rebase", f"origin/{branch}"], capture_output=True, text=True)
+    if result.returncode != 0:
+        subprocess.run(["git", "rebase", "--abort"], capture_output=True, text=True)
+        raise RuntimeError(f"git rebase failed: {(result.stderr or result.stdout)[:3000]}")
+
+
+def git_dirty_paths() -> list[str]:
+    result = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    paths: list[str] = []
+    for raw in result.stdout.splitlines():
+        if not raw or len(raw) < 4:
+            continue
+        path = raw[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        paths.append(path)
+    return paths
+
+
+def stage_and_commit(paths: list[str], message: str) -> None:
+    requested = [str(Path(p)) for p in dict.fromkeys(paths)]
+    dirty_before = set(git_dirty_paths())
+    allowed = set(requested)
+    unexpected = sorted(dirty_before - allowed)
+    if unexpected:
+        raise RuntimeError(
+            "Unexpected working-tree changes before CoinSignal Git commit: "
+            + ", ".join(unexpected[:20])
+        )
+
+    stageable = [p for p in requested if Path(p).exists() or p in dirty_before]
+    if stageable:
+        subprocess.run(["git", "add", "-A", "--", *stageable], check=True)
+
+    staged = subprocess.run(["git", "diff", "--cached", "--quiet"], capture_output=True, text=True)
+    if staged.returncode == 0:
+        print("Git: no staged/local changes for this operation.")
+        return
+    if staged.returncode != 1:
+        raise RuntimeError(f"git staged-diff check failed: {(staged.stderr or staged.stdout)[:2000]}")
+
+    commit = subprocess.run(["git", "commit", "-m", message], capture_output=True, text=True)
+    combined = (commit.stdout or "") + "\n" + (commit.stderr or "")
+    if commit.returncode != 0:
+        raise RuntimeError(f"git commit failed: {combined[:3000]}")
+    print("Git local commit created:", message)
+
+
+def push_head(branch: str) -> None:
+    result = subprocess.run(
+        ["git", "push", "origin", f"HEAD:{branch}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git push failed: {(result.stderr or result.stdout)[:3000]}")
+
+
+def git_commit_push_with_retry(paths: list[str], message: str, branch: str, attempts: int = 5) -> None:
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            # Git is deliberately initialized only when post-publish/state
+            # persistence is actually needed. The publisher critical path
+            # does not depend on Git configuration.
+            configure_git()
+
+            # 1) Stage + commit FIRST so tracked state files are no longer
+            #    unstaged when we fetch/rebase.
+            stage_and_commit(paths, message)
+
+            # 2) Bring that local commit on top of the latest remote main.
+            git_sync_after_local_commit(branch)
+
+            # 3) Push the current HEAD. This also pushes an earlier local
+            #    commit if a previous attempt failed after committing.
+            push_head(branch)
+
+            print(f"Git push succeeded: {message}")
+            return
+        except Exception as exc:
+            last_error = str(exc)
+            print(f"Git push attempt {attempt}/{attempts} failed: {last_error}")
+            if attempt < attempts:
+                time.sleep(backoff_seconds(attempt))
+    raise RuntimeError(f"Git push failed after {attempts} attempts: {last_error}")
+
+
+def safe_filename(value: str, max_len: int = 90) -> str:
+    name = re.sub(r"[^A-Za-z0-9_-]+", "-", value.lower()).strip("-")
+    return name[:max_len].strip("-") or "coinsignal-article"
+
+
+def strip_tags(value: str) -> str:
+    value = re.sub(r"<br\s*/?>", " ", value, flags=re.I)
+    value = re.sub(r"</p\s*>", " ", value, flags=re.I)
+    return re.sub(r"<[^>]+>", " ", value)
+
+
+def compact_text(value: str, limit: int = 420) -> str:
+    text = re.sub(r"\s+", " ", strip_tags(value)).strip()
+    if len(text) <= limit:
+        return text
+    trimmed = text[: limit - 3].rsplit(" ", 1)[0]
+    return trimmed + "..."
+
+
+def encode_meta(meta: dict[str, Any]) -> str:
+    raw = json.dumps(meta, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def decode_meta(blob: str) -> dict[str, Any] | None:
+    try:
+        raw = base64.urlsafe_b64decode(blob.encode("ascii"))
+        value = json.loads(raw.decode("utf-8"))
+        return value if isinstance(value, dict) else None
+    except Exception:
+        return None
+
+
+def marker_html(meta: dict[str, Any]) -> str:
+    sid = html.escape(str(meta["source_id"]), quote=True)
+    blob = encode_meta(meta)
+    return f"<!-- COINSIGNAL_SOURCE_ID:{sid} --><!-- COINSIGNAL_META_B64:{blob} -->"
+
+
+def extract_marker(content: str) -> tuple[str | None, dict[str, Any] | None]:
+    sid_match = re.search(r"COINSIGNAL_SOURCE_ID:([A-Za-z0-9_-]+)", content or "")
+    meta_match = re.search(r"COINSIGNAL_META_B64:([A-Za-z0-9_-]+)", content or "")
+    sid = sid_match.group(1) if sid_match else None
+    meta = decode_meta(meta_match.group(1)) if meta_match else None
+    return sid, meta
+
+
+# Allowlist, not blocklist: the source RSS title/summary that seeds the Gemini
+# prompt is untrusted third-party text, so the model's HTML output is treated as
+# untrusted too before it gets published live on the public blog. This replaces a
+# previous 5-tag regex blocklist that only caught <script/iframe/form/object/embed>
+# and the literal string "javascript:" - it missed on*= event handlers on any tag,
+# <style>/CSS vectors, <svg onload=...>, meta-refresh, etc.
+_ARTICLE_ALLOWED_TAGS = {
+    "p", "h2", "h3", "h4", "ul", "ol", "li", "strong", "em", "b", "i",
+    "a", "blockquote", "img", "br",
+    "table", "thead", "tbody", "tr", "td", "th",
+}
+_ARTICLE_ALLOWED_ATTRIBUTES = {
+    "a": {"href", "title"},
+    "img": {"src", "alt", "title"},
+}
+
+
+def sanitize_article_html(content: str) -> str:
+    return nh3.clean(
+        content or "",
+        tags=_ARTICLE_ALLOWED_TAGS,
+        attributes=_ARTICLE_ALLOWED_ATTRIBUTES,
+        link_rel="nofollow noopener",
+        url_schemes={"http", "https"},
+    )
+
+
+def validate_generated_html(content: str) -> str:
+    content = re.sub(r"\[INTERNAL:\s*[^\]]+\]", "", content or "", flags=re.I)
+    cleaned = sanitize_article_html(content)
+    if not re.search(r"<p\b|<h2\b|<h3\b", cleaned, flags=re.I):
+        raise ValueError("Gemini returned HTML without normal article structure")
+    return cleaned.strip()
+
+
+RSS_URL = "https://cointelegraph.com/rss"
+BLOGGER_API = "https://www.googleapis.com/blogger/v3"
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
+IMAGE_MODEL = "black-forest-labs/FLUX.1-schnell"
+IMAGE_DIR = Path("generated_images")
+PUBLISHED_STATE = Path("published_sources.json")
+FB_QUEUE = Path("facebook_queue.json")
+MAX_ARTICLES = 1
+RSS_CANDIDATES = 50
+RUN_DEADLINE_SECONDS = 45 * 60
+
+
+class PipelineError(RuntimeError):
+    pass
+
+
+def get_config() -> dict[str, str]:
+    values = require_env(
+        "GEMINI_API_KEY",
+        "BLOGGER_BLOG_ID",
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_REFRESH_TOKEN",
+    )
+    models = os.environ.get("GEMINI_MODELS", "").strip()
+    if not models:
+        configured = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
+        configured_fallbacks = [x.strip() for x in os.environ.get("GEMINI_FALLBACK_MODELS", "").split(",") if x.strip()]
+        stable_fallbacks = [
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-2.5-flash",
+        ]
+        ordered = [configured] + configured_fallbacks + stable_fallbacks
+        deduped: list[str] = []
+        for model in ordered:
+            if model and model not in deduped:
+                deduped.append(model)
+        models = ",".join(deduped)
+    values["GEMINI_MODELS"] = models
+    values["HF_TOKEN"] = os.environ.get("HF_TOKEN", "").strip()
+    values["REPO"] = os.environ.get("GITHUB_REPOSITORY", "waqas4868/coinsignal-auto-blog").strip()
+    values["BRANCH"] = os.environ.get("GITHUB_REF_NAME", "main").strip() or "main"
+    return values
+
+
+def get_published_state() -> dict[str, list[str]]:
+    raw = read_json(PUBLISHED_STATE, {"urls": [], "fingerprints": []})
+    if isinstance(raw, list):
+        return {"urls": raw, "fingerprints": []}
+    return {
+        "urls": list(raw.get("urls", [])) if isinstance(raw, dict) else [],
+        "fingerprints": list(raw.get("fingerprints", [])) if isinstance(raw, dict) else [],
+    }
+
+
+def load_publisher_queue() -> list[dict[str, Any]]:
+    raw = read_json(FB_QUEUE, [])
+    return raw if isinstance(raw, list) else []
+
+
+def fetch_rss() -> list[dict[str, str]]:
+    last_error: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            response = requests.get(RSS_URL, timeout=30, headers={"User-Agent": "CoinSignalBot/Final"})
+            if response.status_code == 429:
+                if is_hard_quota(response):
+                    raise_hard_quota(
+                        "rss",
+                        f"HTTP 429: {response_text(response)}",
+                        resume_at=default_cooldown_resume_at(),
+                    )
+                seconds = retry_after_seconds(response)
+                resume = (now_utc() + timedelta(seconds=seconds)).isoformat(timespec="seconds") if seconds else None
+                raise_service_pause("rss", f"HTTP 429: {response_text(response)}", resume_at=resume)
+            if response.status_code in {401, 403}:
+                raise NonRetryableError(f"RSS access denied HTTP {response.status_code}: {response_text(response)}")
+            if response.status_code >= 500:
+                raise PipelineError(f"RSS temporary HTTP {response.status_code}: {response_text(response)}")
+            response.raise_for_status()
+            feed = feedparser.parse(response.content)
+            if getattr(feed, "bozo", 0) and not feed.entries:
+                raise PipelineError(f"RSS parse error: {getattr(feed, 'bozo_exception', 'unknown')}")
+            entries = []
+            for entry in feed.entries[:RSS_CANDIDATES]:
+                title = str(getattr(entry, "title", "") or "").strip()
+                link = str(getattr(entry, "link", "") or "").strip()
+                summary = str(
+                    getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
+                ).strip()
+                if title and link:
+                    entries.append(
+                        {
+                            "title": title,
+                            "link": link,
+                            "summary": re.sub(r"<[^>]+>", " ", summary),
+                        }
+                    )
+            if entries:
+                return entries
+            raise PipelineError("RSS returned no entries")
+        except Exception as exc:
+            last_error = exc
+            print(f"RSS attempt {attempt}/5 failed: {exc}")
+            if attempt < 5:
+                time.sleep(backoff_seconds(attempt))
+    raise_service_pause("rss", f"RSS failed after retries: {last_error}")
+
+
+def refresh_google_token(config: dict[str, str]) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            response = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": config["GOOGLE_CLIENT_ID"],
+                    "client_secret": config["GOOGLE_CLIENT_SECRET"],
+                    "refresh_token": config["GOOGLE_REFRESH_TOKEN"],
+                    "grant_type": "refresh_token",
+                },
+                timeout=45,
+            )
+            if response.ok:
+                token = response.json().get("access_token")
+                if not token:
+                    raise NonRetryableError("Google OAuth refresh response contained no access_token")
+                return token
+            if response.status_code == 429:
+                seconds = retry_after_seconds(response)
+                resume = (now_utc() + timedelta(seconds=seconds)).isoformat(timespec="seconds") if seconds else None
+                raise_service_pause("google_oauth", f"HTTP 429: {response_text(response)}", resume_at=resume)
+            if response.status_code in {500, 502, 503, 504}:
+                last_error = PipelineError(
+                    f"Google OAuth temporary HTTP {response.status_code}: {response_text(response)[:1200]}"
+                )
+                if attempt < 3:
+                    time.sleep(backoff_seconds(attempt, response))
+                    continue
+            raise NonRetryableError(
+                f"Google OAuth refresh failed HTTP {response.status_code}: {response_text(response)}"
+            )
+        except ServicePauseError:
+            raise
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(backoff_seconds(attempt))
+                continue
+            break
+    raise_service_pause("google_oauth", f"Google OAuth refresh failed after retries: {last_error}")
+
+
+def blogger_request(
+    method: str,
+    url: str,
+    access_token: str,
+    **kwargs: Any,
+) -> requests.Response:
+    headers = kwargs.pop("headers", {})
+    headers.update({"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"})
+    return requests.request(method, url, headers=headers, timeout=60, **kwargs)
+
+
+def _blogger_posts_page(
+    blog_id: str, token: str, max_results: int, page_token: str | None
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            url = f"{BLOGGER_API}/blogs/{blog_id}/posts"
+            params: dict[str, Any] = {"maxResults": max_results, "fetchBodies": "true"}
+            if page_token:
+                params["pageToken"] = page_token
+            response = blogger_request("GET", url, token, params=params)
+            if response.status_code == 401:
+                raise NonRetryableError("Blogger access token rejected (401)")
+            if response.status_code == 429:
+                if is_hard_quota(response):
+                    raise_hard_quota(
+                        "blogger",
+                        f"HTTP 429: {response_text(response)}",
+                        resume_at=next_pacific_midnight_utc_iso(),
+                    )
+                seconds = retry_after_seconds(response)
+                resume = (now_utc() + timedelta(seconds=seconds)).isoformat(timespec="seconds") if seconds else None
+                raise_service_pause("blogger", f"HTTP 429: {response_text(response)}", resume_at=resume)
+            if response.status_code in {500, 502, 503, 504}:
+                last_error = PipelineError(
+                    f"Blogger temporary HTTP {response.status_code}: {response_text(response)}"
+                )
+                if attempt < 3:
+                    time.sleep(backoff_seconds(attempt, response))
+                    continue
+                raise_service_pause("blogger", str(last_error))
+            if not response.ok:
+                raise PipelineError(
+                    f"Blogger post list failed HTTP {response.status_code}: {response_text(response)}"
+                )
+            return response.json()
+        except ServicePauseError:
+            raise
+        except HardQuotaError:
+            raise
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(backoff_seconds(attempt))
+                continue
+    raise_service_pause("blogger", f"Blogger post list failed after retries: {last_error}")
+
+
+def blogger_recent_posts(
+    blog_id: str, token: str, max_results: int = 100, max_pages: int = 3
+) -> list[dict[str, Any]]:
+    # Paginates via Blogger's nextPageToken instead of a single fixed-size request.
+    # A single 100-post page meant source-marker dedup silently stopped covering
+    # older posts once the blog passed 100 published articles; the local
+    # published_sources.json file is still the primary defense, this just widens
+    # the server-side safety margin (up to max_pages * max_results posts).
+    posts: list[dict[str, Any]] = []
+    page_token: str | None = None
+    for _ in range(max_pages):
+        page = _blogger_posts_page(blog_id, token, max_results, page_token)
+        posts.extend(page.get("items", []))
+        page_token = page.get("nextPageToken")
+        if not page_token:
+            break
+    return posts
+
+
+def find_existing_by_source(posts: list[dict[str, Any]], sid: str) -> dict[str, Any] | None:
+    for post in posts:
+        content = str(post.get("content", ""))
+        marker_sid, _ = extract_marker(content)
+        if marker_sid == sid:
+            return post
+    return None
+
+
+def build_prompt(source: dict[str, str]) -> str:
+    return f"""
+You are the senior crypto journalist, research editor, SEO strategist, and audience-retention editor for CoinSignal.
+
+Create one original, professional crypto news article from the supplied source item.
+
+SOURCE TITLE:
+{source['title']}
+
+SOURCE URL:
+{source['link']}
+
+SOURCE SUMMARY:
+{source['summary']}
+
+Editorial rules:
+- Use only information supported by the supplied source material.
+- Do not invent quotes, statistics, dates, prices, people, partnerships, events, or URLs.
+- Do not copy or closely paraphrase the source.
+- Clearly distinguish facts from analysis or possible scenarios.
+- Do not give personalized financial advice.
+- Do not make guaranteed predictions.
+- Use a professional newsroom tone, not clickbait or generic AI filler.
+- The original source URL may be cited as the original source.
+- Do not claim CoinSignal tools, products, partnerships, or features exist unless supplied here.
+
+Article structure:
+1. Strong opening that explains why the story matters.
+2. What happened.
+3. Key facts and context.
+4. Why it matters.
+5. What to watch next, only when meaningful and clearly framed as future monitoring rather than fact.
+6. Key takeaways.
+7. Original source.
+8. Concise conclusion.
+
+SEO:
+- Natural search-friendly title.
+- About 900-1200 words when the source supports that depth.
+- Short mobile-friendly paragraphs.
+- Useful H2/H3 headings.
+- Meta description about 140-160 characters.
+
+HTML:
+- Return clean Blogger-compatible fragment only.
+- No <html>, <head>, or <body>.
+- No scripts, iframes, forms, embeds, or javascript URLs.
+- Do not include the hero image; the workflow adds it.
+- Do not invent internal-link URLs.
+
+Return ONLY JSON matching the requested schema.
+""".strip()
+
+
+ARTICLE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "seo_title": {"type": "string"},
+        "meta_description": {"type": "string"},
+        "html_content": {"type": "string"},
+        "labels": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["seo_title", "meta_description", "html_content", "labels"],
+}
+
+
+def gemini_models(config: dict[str, str]) -> list[str]:
+    models: list[str] = []
+    for item in config["GEMINI_MODELS"].split(","):
+        name = item.strip()
+        if name and name not in models:
+            models.append(name)
+    return models
+
+
+def generate_article(config: dict[str, str], source: dict[str, str], deadline: float) -> dict[str, Any]:
+    enforce_service_pause("gemini")
+    prompt = build_prompt(source)
+    models = gemini_models(config)
+    if not models:
+        raise NonRetryableError("No Gemini models configured")
+
+    attempts = 0
+    model_failures: dict[str, int] = {model: 0 for model in models}
+    exhausted: set[str] = set()
+    unusable: set[str] = set()
+    last_error: Exception | None = None
+
+    while time.time() < deadline:
+        available = [m for m in models if m not in exhausted and m not in unusable]
+        if not available:
+            if exhausted and len(exhausted) == len(models):
+                raise_hard_quota(
+                    "gemini",
+                    "All configured Gemini models report daily/monthly quota exhaustion",
+                    resume_at=next_pacific_midnight_utc_iso(),
+                )
+            if exhausted:
+                # Some models may still be usable; keep trying any models that were not quota-exhausted.
+                available = [m for m in models if m not in exhausted]
+            if not available:
+                raise NonRetryableError("All configured Gemini models are unusable")
+
+        model = min(available, key=lambda m: model_failures.get(m, 0))
+        attempts += 1
+        url = f"{GEMINI_API}/models/{model}:generateContent"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": ARTICLE_SCHEMA,
+            },
+        }
+        print(f"Gemini attempt {attempts}; model={model}")
+        try:
+            response = requests.post(
+                url,
+                headers={"x-goog-api-key": config["GEMINI_API_KEY"], "Content-Type": "application/json"},
+                json=payload,
+                timeout=180,
+            )
+            if not response.ok:
+                print("Gemini error:", response.status_code, response_text(response))
+                if response.status_code in (400, 404):
+                    unusable.add(model)
+                    last_error = PipelineError(
+                        f"Gemini model unusable HTTP {response.status_code}: {response_text(response)[:1200]}"
+                    )
+                    continue
+                if response.status_code in RETRYABLE_HTTP:
+                    if is_hard_quota(response):
+                        exhausted.add(model)
+                        last_error = HardQuotaError(
+                            f"Gemini hard quota reported by {model}: {response_text(response)[:1200]}"
+                        )
+                        if len(exhausted) == len(models):
+                            raise_hard_quota(
+                                "gemini",
+                                f"All configured Gemini models exhausted quota. Last response: {response_text(response)[:1200]}",
+                                resume_at=next_pacific_midnight_utc_iso(),
+                            )
+                        continue
+                    model_failures[model] += 1
+                    last_error = PipelineError(f"Gemini temporary HTTP {response.status_code}")
+                    time.sleep(backoff_seconds(model_failures[model], response))
+                    continue
+                raise NonRetryableError(
+                    f"Gemini non-retryable HTTP {response.status_code}: {response_text(response)}"
+                )
+
+            payload_json = response.json()
+            candidate = payload_json.get("candidates", [{}])[0]
+            parts = candidate.get("content", {}).get("parts", [])
+            text = next((p.get("text") for p in parts if isinstance(p, dict) and p.get("text")), None)
+            if not text:
+                raise PipelineError("Gemini returned no text candidate")
+            result = json.loads(text)
+            html_content = validate_generated_html(str(result.get("html_content", "")))
+            title = str(result.get("seo_title", "")).strip()
+            meta = str(result.get("meta_description", "")).strip()
+            labels = result.get("labels", [])
+            if not title or not meta or not html_content:
+                raise PipelineError("Gemini response missing required article fields")
+            if not isinstance(labels, list):
+                labels = []
+            labels = [str(x).strip() for x in labels if str(x).strip()][:10]
+            if not labels:
+                labels = ["Crypto News", "Crypto", "Blockchain", "Markets"]
+            clear_service_pause("gemini")
+            print(f"Gemini success on model={model}")
+            return {
+                "seo_title": title,
+                "meta_description": meta[:180],
+                "html_content": html_content,
+                "labels": labels,
+            }
+        except HardQuotaError:
+            raise
+        except (requests.RequestException, json.JSONDecodeError, PipelineError) as exc:
+            last_error = exc
+            model_failures[model] += 1
+            if time.time() >= deadline:
+                break
+            wait = min(backoff_seconds(model_failures[model]), 60)
+            time.sleep(wait)
+    raise_service_pause("gemini", f"Gemini generation failed/timed out after retries: {last_error}")
+
+
+def generate_image(config: dict[str, str], title: str, output_path: Path, deadline: float) -> bool:
+    enforce_service_pause("image")
+    if not config["HF_TOKEN"]:
+        raise NonRetryableError("HF_TOKEN is required; CoinSignal will not publish an article without its hero image")
+    # Explicit timeout: unlike every other network call in this script, text_to_image()
+    # previously had no per-call timeout, so a hung request could stall the job until
+    # the workflow's 60-minute hard kill instead of being retried by the loop below.
+    client = InferenceClient(provider="auto", api_key=config["HF_TOKEN"], timeout=120)
+    prompt = (
+        "Professional editorial cryptocurrency news image, realistic financial newsroom aesthetic, "
+        "modern blockchain/markets atmosphere, cinematic but credible lighting, landscape 16:9, "
+        "no text, no logos, no watermark. Article headline: " + title
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        if time.time() >= deadline:
+            break
+        try:
+            image = client.text_to_image(prompt=prompt, model=IMAGE_MODEL)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            image.save(output_path)
+            clear_service_pause("image")
+            return True
+        except Exception as exc:
+            last_error = exc
+            response = exception_response(exc)
+            status = getattr(response, "status_code", None)
+            print(f"Image attempt {attempt}/3 failed: {exc}")
+
+            if is_hard_quota(response, str(exc)):
+                raise_hard_quota(
+                    "image",
+                    f"Hugging Face quota response: {str(exc)[:1600]}",
+                    resume_at=default_cooldown_resume_at(),
+                )
+            if status == 429:
+                seconds = rate_limit_reset_seconds(response)
+                resume = (now_utc() + timedelta(seconds=seconds)).isoformat(timespec="seconds") if seconds else None
+                raise_service_pause("image", f"Hugging Face rate limit HTTP 429: {str(exc)[:1600]}", resume_at=resume)
+            if status in {401, 403}:
+                raise NonRetryableError(f"Hugging Face image authentication/permission failure: {str(exc)[:1600]}")
+            if status in {400, 404}:
+                raise NonRetryableError(f"Hugging Face image request rejected HTTP {status}: {str(exc)[:1600]}")
+            if status in {500, 502, 503, 504} and attempt < 3:
+                time.sleep(min(30 * attempt, 60))
+                continue
+            if status is None and attempt < 3:
+                time.sleep(min(30 * attempt, 60))
+                continue
+            if status not in {500, 502, 503, 504} and attempt < 3:
+                time.sleep(min(30 * attempt, 60))
+    raise_service_pause("image", f"Image generation failed after retries; article was not published: {last_error}")
+
+
+def blogger_insert(
+    config: dict[str, str],
+    token: str,
+    payload: dict[str, Any],
+    source_marker_id: str,
+    deadline: float,
+) -> dict[str, Any]:
+    url = f"{BLOGGER_API}/blogs/{config['BLOGGER_BLOG_ID']}/posts"
+    last_error: Exception | None = None
+
+    def verify_existing() -> dict[str, Any] | None:
+        if not source_marker_id:
+            return None
+        try:
+            posts = blogger_recent_posts(config["BLOGGER_BLOG_ID"], token, 100)
+            return find_existing_by_source(posts, source_marker_id)
+        except (HardQuotaError, ServicePauseError):
+            raise
+        except Exception as exc:
+            print("Blogger post verification warning:", exc)
+            return None
+
+    for attempt in range(1, 6):
+        if time.time() >= deadline:
+            break
+        try:
+            response = blogger_request("POST", url, token, json=payload)
+            if response.ok:
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    last_error = PipelineError(f"Blogger success response was not valid JSON: {exc}")
+                    existing = verify_existing()
+                    if existing:
+                        return existing
+                    if attempt < 5:
+                        time.sleep(backoff_seconds(attempt))
+                        continue
+                    break
+
+            if response.status_code == 401:
+                token = refresh_google_token(config)
+                continue
+
+            if response.status_code == 429:
+                if is_hard_quota(response):
+                    raise_hard_quota(
+                        "blogger",
+                        f"HTTP 429: {response_text(response)}",
+                        resume_at=next_pacific_midnight_utc_iso(),
+                    )
+                seconds = retry_after_seconds(response)
+                resume = (now_utc() + timedelta(seconds=seconds)).isoformat(timespec="seconds") if seconds else None
+                raise_service_pause("blogger", f"HTTP 429: {response_text(response)}", resume_at=resume)
+
+            if response.status_code in {408, 425, 500, 502, 503, 504}:
+                last_error = PipelineError(f"Blogger temporary HTTP {response.status_code}")
+                existing = verify_existing()
+                if existing:
+                    return existing
+                if attempt < 5:
+                    time.sleep(backoff_seconds(attempt, response))
+                    continue
+
+            raise NonRetryableError(
+                f"Blogger insert failed HTTP {response.status_code}: {response_text(response)}"
+            )
+        except requests.RequestException as exc:
+            last_error = exc
+            existing = verify_existing()
+            if existing:
+                return existing
+            time.sleep(backoff_seconds(attempt))
+
+    raise_service_pause("blogger", f"Blogger insert failed after retries: {last_error}")
+
+
+def make_blogger_payload(
+    source: dict[str, str], article: dict[str, Any], image_url: str | None, sid: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    meta = {
+        "source_id": sid,
+        "source_url": normalize_url(source["link"]),
+        "summary": article["meta_description"],
+        "image_url": image_url or "",
+    }
+    marker = marker_html(meta)
+    body = article["html_content"]
+    if image_url:
+        hero = (
+            f'<p style="text-align:center;margin:0 0 24px;">'
+            f'<img src="{html.escape(image_url, quote=True)}" '
+            f'alt="{html.escape(article["seo_title"], quote=True)}" '
+            f'style="display:block;width:100%;height:auto;" />'
+            f"</p>"
+        )
+    else:
+        hero = ""
+    source_block = (
+        '<p><strong>Original source:</strong> '
+        f'<a href="{html.escape(source["link"], quote=True)}" rel="nofollow noopener">'
+        f"{html.escape(source['title'])}</a></p>"
+    )
+    content = f"{marker}{hero}{body}{source_block}"
+    payload = {
+        "kind": "blogger#post",
+        "title": article["seo_title"],
+        "content": content,
+        "labels": article["labels"],
+    }
+    # Internal-only field removed before HTTP send, but retained for idempotency check by caller.
+    payload_with_id = dict(payload)
+    payload_with_id["_coinsignal_source_id"] = sid
+    return payload_with_id, meta
+
+
+def persist_publisher_checkpoint(config: dict[str, str], checkpoint: dict[str, Any], message: str) -> None:
+    # CRITICAL PATH RULE: never call GitHub/Git before Blogger publication.
+    # The runner-local checkpoint protects this run without allowing Git
+    # synchronization problems to block RSS -> Gemini -> Image -> Blogger.
+    write_json(PUBLISHER_INFLIGHT, checkpoint)
+    print("Local publisher checkpoint saved:", message)
+
+
+def persist_states(
+    config: dict[str, str],
+    state: dict[str, Any],
+    queue: list[dict[str, Any]],
+    message: str,
+    *,
+    clear_inflight: bool = False,
+) -> None:
+    write_json(PUBLISHED_STATE, state)
+    write_json(FB_QUEUE, queue)
+    paths = [str(PUBLISHED_STATE), str(FB_QUEUE), str(QUOTA_STATE)]
+    if clear_inflight:
+        if PUBLISHER_INFLIGHT.exists():
+            PUBLISHER_INFLIGHT.unlink()
+        paths.append(str(PUBLISHER_INFLIGHT))
+    git_commit_push_with_retry(paths, message, config["BRANCH"])
+
+
+def publisher_main() -> None:
+    config = get_config()
+    # Git is intentionally NOT configured/synced on the publisher critical path.
+    # This prevents GitHub state conflicts from stopping Blogger before publish.
+    branch = config["BRANCH"]
+    print("CoinSignal publisher starting; Facebook is NOT part of the publisher critical path")
+    print("Git state is deferred until after Blogger")
+    enforce_service_pause("rss")
+    enforce_service_pause("gemini")
+    enforce_service_pause("image")
+    enforce_service_pause("blogger")
+    enforce_service_pause("google_oauth")
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    state = get_published_state()
+    published_urls = {normalize_url(x) for x in state["urls"]}
+    published_fps = set(state["fingerprints"])
+
+    inflight = read_json(PUBLISHER_INFLIGHT, {})
+    resuming = isinstance(inflight, dict) and isinstance(inflight.get("source"), dict) and isinstance(inflight.get("article"), dict)
+    if PUBLISHER_INFLIGHT.exists() and not resuming:
+        raise NonRetryableError("publisher_inflight.json exists but is incomplete; refusing to regenerate an unknown draft")
+
+    if resuming:
+        source = dict(inflight["source"])
+        sid = str(inflight.get("source_id", "")).strip() or source_id(source.get("link", ""))
+        article = dict(inflight["article"])
+        print("RESUME: loaded runner-local publisher checkpoint for", sid)
+    else:
+        sources = fetch_rss()
+        source = None
+        for item in sources:
+            normalized = normalize_url(item["link"])
+            fp = title_fingerprint(item["title"])
+            if normalized not in published_urls and fp not in published_fps:
+                source = item
+                break
+        if not source:
+            print("No new RSS story available; successful no-op")
+            return
+        sid = source_id(source["link"])
+
+    token = refresh_google_token(config)
+    recent = blogger_recent_posts(config["BLOGGER_BLOG_ID"], token, 100)
+    existing = find_existing_by_source(recent, sid)
+    if existing:
+        print("Existing Blogger post already contains this source marker:", existing.get("url"))
+        post_url = existing.get("url", "")
+        marker_sid, meta = extract_marker(str(existing.get("content", "")))
+        queue = load_publisher_queue()
+        if post_url and marker_sid == sid and not any(x.get("source_id") == sid for x in queue):
+            queue.append(
+                {
+                    "source_id": sid,
+                    "title": existing.get("title", source["title"]),
+                    "summary": (meta or {}).get("summary", source.get("summary", "")),
+                    "article_url": post_url,
+                    "image_url": (meta or {}).get("image_url", ""),
+                    "status": "pending",
+                    "attempts": 0,
+                    "created_at": existing.get("published", "") or "",
+                    "next_attempt_at": "",
+                    "last_error": "",
+                }
+            )
+        if normalize_url(source["link"]) not in published_urls:
+            state["urls"].append(source["link"])
+            published_urls.add(normalize_url(source["link"]))
+        if sid not in published_fps:
+            state["fingerprints"].append(title_fingerprint(source["title"]))
+        clear_service_pause("blogger")
+        try:
+            persist_states(
+                config,
+                state,
+                queue,
+                f"Recover CoinSignal publication {sid}",
+                clear_inflight=True,
+            )
+        except Exception as exc:
+            # Blogger already exists. Git/state persistence is recovery bookkeeping
+            # and must not turn a successful Blogger recovery into a publisher failure.
+            print("POST-PUBLISH RECOVERY STATE WARNING (Blogger already exists):", exc)
+        return
+
+    if not resuming:
+        deadline = time.time() + RUN_DEADLINE_SECONDS
+        article = generate_article(config, source, deadline)
+        print("Generated:", article["seo_title"])
+        checkpoint = {
+            "version": 1,
+            "source_id": sid,
+            "source": source,
+            "article": article,
+            "image_path": str(IMAGE_DIR / f"{safe_filename(article['seo_title'])}-{sid}.png"),
+            "image_url": "",
+            "created_at": iso_now(),
+        }
+        persist_publisher_checkpoint(config, checkpoint, f"Checkpoint CoinSignal draft {sid}")
+    else:
+        deadline = time.time() + RUN_DEADLINE_SECONDS
+        checkpoint = dict(inflight)
+
+    image_path = Path(str(checkpoint.get("image_path") or IMAGE_DIR / f"{safe_filename(article['seo_title'])}-{sid}.png"))
+    image_url = str(checkpoint.get("image_url", "")).strip()
+
+    if not image_url and image_path.exists():
+        image_url = f"https://raw.githubusercontent.com/{config['REPO']}/{branch}/{image_path.as_posix()}"
+        checkpoint["image_url"] = image_url
+        checkpoint["image_ready"] = True
+        write_json(PUBLISHER_INFLIGHT, checkpoint)
+        print("Existing local image checkpoint found; continuing to Blogger:", image_path)
+    elif not image_url:
+        if not generate_image(config, article["seo_title"], image_path, deadline):
+            raise PipelineError("Image generation returned no image; article was not published")
+        image_url = f"https://raw.githubusercontent.com/{config['REPO']}/{branch}/{image_path.as_posix()}"
+        checkpoint["image_url"] = image_url
+        checkpoint["image_ready"] = True
+        write_json(PUBLISHER_INFLIGHT, checkpoint)
+        # Do NOT push Git state here. Blogger is the first external publication
+        # side effect. Git persistence happens only after Blogger succeeds.
+
+    payload, meta = make_blogger_payload(source, article, image_url, sid)
+    existing_payload = dict(payload)
+    existing_payload.pop("_coinsignal_source_id", None)
+    post = blogger_insert(config, token, existing_payload, sid, deadline)
+    post_url = str(post.get("url", "")).strip()
+    if not post_url:
+        token = refresh_google_token(config)
+        recent = blogger_recent_posts(config["BLOGGER_BLOG_ID"], token, 100)
+        found = find_existing_by_source(recent, sid)
+        if found:
+            post = found
+            post_url = str(found.get("url", "")).strip()
+    if not post_url:
+        raise PipelineError("Blogger returned no public post URL")
+
+    clear_service_pause("blogger")
+    # Blogger has succeeded. From this point onward Git/queue persistence
+    # is bookkeeping and must never prevent the publication itself.
+    queue = load_publisher_queue()
+    if not any(x.get("source_id") == sid for x in queue):
+        queue.append(
+            {
+                "source_id": sid,
+                "title": article["seo_title"],
+                "summary": article["meta_description"],
+                "article_url": post_url,
+                "image_url": image_url,
+                "status": "pending",
+                "attempts": 0,
+                "created_at": post.get("published", "") or pkt_date(),
+                "next_attempt_at": "",
+                "last_error": "",
+            }
+        )
+
+    normalized_source = normalize_url(source["link"])
+    if normalized_source not in published_urls:
+        state["urls"].append(source["link"])
+    if title_fingerprint(source["title"]) not in published_fps:
+        state["fingerprints"].append(title_fingerprint(source["title"]))
+
+    try:
+        # Post-publish persistence may include the hero image. This is deliberately
+        # AFTER Blogger success, so GitHub can never block the Blogger publication.
+        write_json(PUBLISHED_STATE, state)
+        write_json(FB_QUEUE, queue)
+        paths = [str(image_path), str(PUBLISHED_STATE), str(FB_QUEUE), str(QUOTA_STATE)]
+        if PUBLISHER_INFLIGHT.exists():
+            PUBLISHER_INFLIGHT.unlink()
+        paths.append(str(PUBLISHER_INFLIGHT))
+        git_commit_push_with_retry(
+            paths,
+            f"Track CoinSignal publication {sid} and persist hero image",
+            config["BRANCH"],
+        )
+        print("SUCCESS: Blogger published, hero image persisted, Facebook queue persisted", post_url)
+    except Exception as exc:
+        # IMPORTANT: Blogger is already published. Never report the article as
+        # unpublished merely because GitHub state persistence failed. The next
+        # scheduled publisher run re-checks Blogger by source marker and recovers
+        # the Facebook queue without regenerating the article.
+        print("POST-PUBLISH STATE WARNING (Blogger already succeeded):", exc)
+        print("SUCCESS: Blogger published; Git/queue persistence will be recovered on next run", post_url)
+
+
+FACEBOOK_GRAPH_VERSION = os.environ.get("FACEBOOK_GRAPH_VERSION", "v26.0").strip() or "v26.0"
+QUEUE_FILE = Path("facebook_queue.json")
+STATE_FILE = Path("facebook_state.json")
+MAX_DAILY_POSTS = 3
+WORKER_MAX_SECONDS = 45 * 60
+
+
+def config() -> dict[str, str]:
+    values = require_env("FACEBOOK_PAGE_ID", "FACEBOOK_PAGE_ACCESS_TOKEN")
+    for optional in [
+        "BLOGGER_BLOG_ID",
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_REFRESH_TOKEN",
+    ]:
+        values[optional] = os.environ.get(optional, "").strip()
+    values["BRANCH"] = os.environ.get("GITHUB_REF_NAME", "main").strip() or "main"
+    return values
+
+
+def load_facebook_queue() -> list[dict[str, Any]]:
+    raw = read_json(QUEUE_FILE, [])
+    return raw if isinstance(raw, list) else []
+
+
+def load_state() -> dict[str, Any]:
+    raw = read_json(STATE_FILE, {})
+    today = pkt_date()
+    if not isinstance(raw, dict):
+        raw = {}
+    if raw.get("date") != today:
+        return {
+            "date": today,
+            "count": 0,
+            "posted_source_ids": list(raw.get("posted_source_ids", [])),
+            "posted_urls": list(raw.get("posted_urls", [])),
+            "posts": list(raw.get("posts", []))[-500:],
+        }
+    return {
+        "date": today,
+        "count": int(raw.get("count", 0)),
+        "posted_source_ids": list(raw.get("posted_source_ids", [])),
+        "posted_urls": list(raw.get("posted_urls", [])),
+        "posts": list(raw.get("posts", []))[-500:],
+    }
+
+
+def save(queue: list[dict[str, Any]], state: dict[str, Any], cfg: dict[str, str], message: str) -> None:
+    write_json(QUEUE_FILE, queue)
+    write_json(STATE_FILE, state)
+    write_json(QUOTA_STATE, quota_state())
+    git_commit_push_with_retry(
+        [str(QUEUE_FILE), str(STATE_FILE), str(QUOTA_STATE)],
+        message,
+        cfg["BRANCH"],
+    )
+
+
+def facebook_url(page_id: str, edge: str = "") -> str:
+    suffix = f"/{edge}" if edge else ""
+    return f"https://graph.facebook.com/{FACEBOOK_GRAPH_VERSION}/{page_id}{suffix}"
+
+
+def validate_direct_page_token(cfg: dict[str, str]) -> None:
+    """Validate the token currently stored in cfg as a Page token."""
+    token = cfg["FACEBOOK_PAGE_ACCESS_TOKEN"]
+    try:
+        response = requests.get(
+            facebook_url(cfg["FACEBOOK_PAGE_ID"]),
+            params={"fields": "id,name", "access_token": token},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise_service_pause("facebook", f"Page validation network error: {exc}")
+    if response.status_code == 429:
+        if is_hard_quota(response):
+            raise_hard_quota(
+                "facebook",
+                f"HTTP 429: {response_text(response)}",
+                resume_at=default_cooldown_resume_at(),
+            )
+        seconds = retry_after_seconds(response)
+        resume = (now_utc() + timedelta(seconds=seconds)).isoformat(timespec="seconds") if seconds else None
+        raise_service_pause("facebook", f"HTTP 429: {response_text(response)}", resume_at=resume)
+    if response.status_code >= 500:
+        raise_service_pause("facebook", f"Page validation HTTP {response.status_code}: {response_text(response)}")
+    if not response.ok:
+        raise NonRetryableError(
+            f"Facebook Page token validation failed HTTP {response.status_code}: {response_text(response)}"
+        )
+    data = response.json()
+    if str(data.get("id")) != str(cfg["FACEBOOK_PAGE_ID"]):
+        raise NonRetryableError("FACEBOOK_PAGE_ID does not match the Page returned by the access token")
+    print("Facebook Page verified:", data.get("name"), data.get("id"))
+
+
+def facebook_permissions_for_user(token: str) -> set[str]:
+    """Return granted Facebook permissions for a User Access Token."""
+    try:
+        response = requests.get(
+            facebook_url("me", "permissions"),
+            params={"access_token": token},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise_service_pause("facebook", f"User-token permission check network error: {exc}")
+    if response.status_code == 429:
+        if is_hard_quota(response):
+            raise_hard_quota(
+                "facebook",
+                f"HTTP 429: {response_text(response)}",
+                resume_at=default_cooldown_resume_at(),
+            )
+        seconds = retry_after_seconds(response)
+        resume = (now_utc() + timedelta(seconds=seconds)).isoformat(timespec="seconds") if seconds else None
+        raise_service_pause("facebook", f"HTTP 429: {response_text(response)}", resume_at=resume)
+    if response.status_code >= 500:
+        raise_service_pause("facebook", f"User-token permission check HTTP {response.status_code}: {response_text(response)}")
+    if not response.ok:
+        raise NonRetryableError(
+            f"Facebook User Access Token permission check failed HTTP {response.status_code}: {response_text(response)}"
+        )
+    rows = response.json().get("data", [])
+    granted = {
+        str(row.get("permission", "")).strip()
+        for row in rows
+        if str(row.get("status", "")).strip().lower() == "granted"
+    }
+    return granted
+
+
+def resolve_page_access_token(cfg: dict[str, str]) -> None:
+    """Accept either a Page token or a User token in the existing GitHub secret.
+
+    If the stored token is a User Access Token, automatically obtain the matching
+    Page Access Token from /me/accounts and use that Page token for publishing.
+    If /me/accounts rejects the token as a Page token, fall back to direct Page-token validation.
+    """
+    configured_token = cfg["FACEBOOK_PAGE_ACCESS_TOKEN"].strip()
+    if not configured_token:
+        raise NonRetryableError("FACEBOOK_PAGE_ACCESS_TOKEN is empty")
+
+    try:
+        response = requests.get(
+            facebook_url("me", "accounts"),
+            params={
+                "fields": "id,name,access_token,tasks",
+                "limit": 100,
+                "access_token": configured_token,
+            },
+            timeout=45,
+        )
+    except requests.RequestException as exc:
+        raise_service_pause("facebook", f"Facebook /me/accounts network error: {exc}")
+
+    if response.status_code == 429:
+        if is_hard_quota(response):
+            raise_hard_quota(
+                "facebook",
+                f"HTTP 429: {response_text(response)}",
+                resume_at=default_cooldown_resume_at(),
+            )
+        seconds = retry_after_seconds(response)
+        resume = (now_utc() + timedelta(seconds=seconds)).isoformat(timespec="seconds") if seconds else None
+        raise_service_pause("facebook", f"Facebook /me/accounts HTTP 429: {response_text(response)}", resume_at=resume)
+    if response.status_code >= 500:
+        raise_service_pause("facebook", f"Facebook /me/accounts HTTP {response.status_code}: {response_text(response)}")
+
+    if response.ok:
+        # This is a User Access Token path. Validate the three permissions that
+        # the Page publishing flow depends on before accepting the derived Page token.
+        permissions = facebook_permissions_for_user(configured_token)
+        required = {"pages_show_list", "pages_manage_posts", "pages_read_engagement"}
+        missing = sorted(required - permissions)
+        if missing:
+            raise NonRetryableError(
+                "Fresh Facebook User Access Token is missing required granted permissions: "
+                + ", ".join(missing)
+            )
+
+        pages = response.json().get("data", [])
+        target = next(
+            (
+                page
+                for page in pages
+                if str(page.get("id", "")).strip() == str(cfg["FACEBOOK_PAGE_ID"]).strip()
+            ),
+            None,
+        )
+        if target and str(target.get("access_token", "")).strip():
+            cfg["FACEBOOK_PAGE_ACCESS_TOKEN"] = str(target["access_token"]).strip()
+            print("Facebook Page token auto-resolved from User token:", target.get("name"), target.get("id"))
+            tasks = target.get("tasks") or []
+            if isinstance(tasks, list) and tasks:
+                print("Facebook Page tasks available:", ", ".join(str(x) for x in tasks))
+            validate_direct_page_token(cfg)
+            return
+
+        raise NonRetryableError(
+            "Facebook User Access Token is valid, but the configured Page was not returned by /me/accounts "
+            f"for Page ID {cfg['FACEBOOK_PAGE_ID']}"
+        )
+
+    # The token may already be a Page Access Token. /me/accounts normally expects a
+    # User Access Token, so a failed /me/accounts call is not by itself fatal.
+    body = response_text(response)
+    lowered = body.lower()
+    if "\"code\":190" in lowered or "session has expired" in lowered or "invalid oauth" in lowered:
+        raise NonRetryableError(
+            "Facebook access token is expired or invalid. Generate a fresh User Access Token in Graph API Explorer "
+            "and save it to the existing GitHub secret FACEBOOK_PAGE_ACCESS_TOKEN. "
+            f"Meta response: {body[:1200]}"
+        )
+
+    cfg["FACEBOOK_PAGE_ACCESS_TOKEN"] = configured_token
+    validate_direct_page_token(cfg)
+    print("Facebook token accepted directly as a Page Access Token")
+
+
+def reopen_known_permission_failures(queue: list[dict[str, Any]]) -> bool:
+    """Requeue only definitive permission rejections that cannot have posted the Page item."""
+    changed = False
+    marker_a = "requires both pages_read_engagement and pages_manage_posts"
+    marker_b = "(#200)"
+    for item in queue:
+        if item.get("status") != "failed":
+            continue
+        error = str(item.get("last_error", "")).lower()
+        if marker_a in error or marker_b in error:
+            item["status"] = "retry"
+            item["next_attempt_at"] = ""
+            item["last_error"] = (
+                "Reopened after definitive Facebook Code 200 permission rejection; "
+                "the worker will retry using the auto-resolved Page Access Token."
+            )
+            changed = True
+    return changed
+
+
+def facebook_already_posted_locally(state: dict[str, Any], item: dict[str, Any]) -> bool:
+    """Use only our durable GitHub state for Facebook idempotency.
+
+    This deliberately avoids GET /PAGE_ID/feed, which was the Meta endpoint
+    returning Code 10 in the current setup.
+    """
+    sid = str(item.get("source_id", "")).strip()
+    article_url = normalize_url(str(item.get("article_url", "")).strip())
+    posted_ids = {str(x).strip() for x in state.get("posted_source_ids", []) if str(x).strip()}
+    posted_urls = {normalize_url(str(x).strip()) for x in state.get("posted_urls", []) if str(x).strip()}
+    return bool(
+        (sid and sid in posted_ids)
+        or (article_url and article_url in posted_urls)
+    )
+
+
+def reconcile_local_facebook_status(item: dict[str, Any]) -> None:
+    """Mark a queue item posted when our own state already says it was posted."""
+    item["status"] = "posted"
+    item["next_attempt_at"] = ""
+    item["last_error"] = ""
+
+
+def mark_facebook_posted(
+    item: dict[str, Any],
+    state: dict[str, Any],
+    post_id: Any,
+    *,
+    recovered: bool = False,
+) -> None:
+    """Persist a successful Facebook POST using only the POST response and local state."""
+    sid = str(item.get("source_id", ""))
+    article_url = normalize_url(str(item.get("article_url", "")))
+    item["status"] = "posted"
+    item["next_attempt_at"] = ""
+    item["last_error"] = ""
+    if sid and sid not in state["posted_source_ids"]:
+        state["posted_source_ids"].append(sid)
+        state["count"] += 1
+    if article_url and article_url not in {normalize_url(str(x)) for x in state["posted_urls"]}:
+        state["posted_urls"].append(article_url)
+    state["posts"].append({
+        "source_id": sid,
+        "url": article_url,
+        "post_id": post_id,
+        "recovered": bool(recovered),
+        "time": now_utc().isoformat(),
+    })
+
+
+def post_once(cfg: dict[str, str], item: dict[str, Any]) -> requests.Response:
+    summary = re.sub(r"\s+", " ", str(item.get("summary", ""))).strip()
+    if len(summary) > 420:
+        summary = summary[:417].rsplit(" ", 1)[0] + "..."
+    message = f"{item['title']}\n\n{summary}\n\nRead the full story on CoinSignal: {item['article_url']}"
+    return requests.post(
+        facebook_url(cfg["FACEBOOK_PAGE_ID"], "feed"),
+        data={
+            "message": message,
+            "link": item["article_url"],
+            "access_token": cfg["FACEBOOK_PAGE_ACCESS_TOKEN"],
+        },
+        timeout=90,
+    )
+
+
+def classify_facebook_error(response: requests.Response) -> tuple[bool, str]:
+    body = response_text(response)
+    lowered = body.lower()
+    if response.status_code == 429:
+        return True, f"Retryable Facebook HTTP 429: {body[:1200]}"
+    if response.status_code in {408, 425, 500, 502, 503, 504}:
+        return False, (
+            f"Uncertain Facebook POST outcome HTTP {response.status_code}; "
+            f"automatic retry is blocked to avoid duplicate Page posts: {body[:1200]}"
+        )
+    if any(token in lowered for token in ["oauth", "access token", "permission", "insufficient permission", "(#190)", "(#200)", "(#100)"]):
+        return False, f"Non-retryable Facebook auth/permission/parameter error: {body[:1600]}"
+    if 400 <= response.status_code < 500:
+        return False, f"Non-retryable Facebook HTTP {response.status_code}: {body[:1600]}"
+    return False, f"Uncertain Facebook HTTP {response.status_code}: {body[:1600]}"
+
+
+def recover_queue_from_blogger(cfg: dict[str, str], queue: list[dict[str, Any]], state: dict[str, Any]) -> bool:
+    needed = all(cfg.get(k) for k in ["BLOGGER_BLOG_ID", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN"])
+    if not needed:
+        return False
+    try:
+        token_response = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": cfg["GOOGLE_CLIENT_ID"],
+                "client_secret": cfg["GOOGLE_CLIENT_SECRET"],
+                "refresh_token": cfg["GOOGLE_REFRESH_TOKEN"],
+                "grant_type": "refresh_token",
+            },
+            timeout=45,
+        )
+        if not token_response.ok:
+            print("Blogger recovery skipped; OAuth refresh failed")
+            return False
+        token = token_response.json().get("access_token")
+        if not token:
+            return False
+        response = requests.get(
+            f"{BLOGGER_API}/blogs/{cfg['BLOGGER_BLOG_ID']}/posts",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"maxResults": 50, "fetchBodies": "true"},
+            timeout=60,
+        )
+        if not response.ok:
+            print("Blogger recovery skipped HTTP", response.status_code)
+            return False
+        existing_ids = {x.get("source_id") for x in queue}
+        changed = False
+        for post in response.json().get("items", []):
+            content = str(post.get("content", ""))
+            sid, meta = extract_marker(content)
+            if not sid or sid in existing_ids or sid in set(state.get("posted_source_ids", [])):
+                continue
+            if not post.get("url"):
+                continue
+            meta = meta or {}
+            queue.append(
+                {
+                    "source_id": sid,
+                    "title": post.get("title", "CoinSignal News"),
+                    "summary": meta.get("summary", ""),
+                    "article_url": post.get("url", ""),
+                    "image_url": meta.get("image_url", ""),
+                    "status": "pending",
+                    "attempts": 0,
+                    "created_at": post.get("published", ""),
+                    "next_attempt_at": "",
+                    "last_error": "",
+                }
+            )
+            existing_ids.add(sid)
+            changed = True
+        return changed
+    except (HardQuotaError, ServicePauseError):
+        raise
+    except Exception as exc:
+        print("Blogger queue recovery warning:", exc)
+        return False
+
+
+def facebook_main() -> None:
+    cfg = config()
+    configure_git()
+    ensure_branch()
+    enforce_service_pause("facebook")
+
+    queue = load_facebook_queue()
+    state = load_state()
+
+    # The existing GitHub secret is intentionally accepted as either a fresh User
+    # Access Token or a Page Access Token. A User token is converted automatically
+    # to the matching Page token before any publish call.
+    resolve_page_access_token(cfg)
+    startup_reconciled = reopen_known_permission_failures(queue)
+
+    # Reconcile only from our own durable state. No Facebook feed/read endpoint is used.
+    for item in queue:
+        if item.get("status") not in {"pending", "retry"}:
+            continue
+        if facebook_already_posted_locally(state, item):
+            reconcile_local_facebook_status(item)
+            startup_reconciled = True
+
+    changed = recover_queue_from_blogger(cfg, queue, state)
+    if startup_reconciled or changed:
+        save(queue, state, cfg, "Persist Facebook local-state reconciliation")
+
+    deadline = time.time() + WORKER_MAX_SECONDS
+    posted_this_run = 0
+    eligible = []
+    now = now_utc()
+
+    for item in queue:
+        if item.get("status") not in {"pending", "retry"}:
+            continue
+        next_at = str(item.get("next_attempt_at", "")).strip()
+        if next_at:
+            try:
+                if datetime.fromisoformat(next_at.replace("Z", "+00:00")) > now:
+                    continue
+            except Exception:
+                pass
+        eligible.append(item)
+    eligible.sort(key=lambda x: str(x.get("created_at", "")))
+
+    remaining_daily = max(0, MAX_DAILY_POSTS - int(state["count"]))
+    print(f"Facebook queue: {len(eligible)} eligible, daily remaining={remaining_daily}")
+    if remaining_daily == 0:
+        print("Facebook daily limit reached; worker exits successfully.")
+        return
+
+    for item in eligible[:remaining_daily]:
+        if time.time() >= deadline:
+            break
+        sid = str(item.get("source_id", ""))
+        article_url = normalize_url(str(item.get("article_url", "")))
+        if not sid or not article_url:
+            item["status"] = "failed"
+            item["last_error"] = "Missing source_id/article_url"
+            item["next_attempt_at"] = ""
+            save(queue, state, cfg, "Mark invalid Facebook queue item")
+            continue
+
+        # Local idempotency check. This is intentionally NOT a Facebook GET.
+        if facebook_already_posted_locally(state, item):
+            reconcile_local_facebook_status(item)
+            save(queue, state, cfg, f"Reconcile Facebook local state {sid}")
+            continue
+
+        # Mark the item as actively posting before the network call. If the request
+        # outcome becomes ambiguous, we leave the item blocked rather than blindly retrying.
+        item["status"] = "posting"
+        item["attempts"] = int(item.get("attempts", 0)) + 1
+        item["last_error"] = ""
+        item["next_attempt_at"] = ""
+        save(queue, state, cfg, f"Begin Facebook POST {sid}")
+
+        try:
+            response = post_once(cfg, item)
+        except requests.RequestException as exc:
+            item["status"] = "uncertain"
+            item["last_error"] = (
+                "Facebook POST outcome is uncertain; automatic retry was blocked to avoid a duplicate. "
+                f"Network error: {exc}"
+            )[:1600]
+            save(queue, state, cfg, f"Hold uncertain Facebook POST {sid}")
+            print("Facebook POST uncertain:", item["last_error"])
+            continue
+
+        if response.status_code == 429:
+            if is_hard_quota(response):
+                # The POST was explicitly rejected by rate limiting; it is safe to return
+                # this item to retry state because Facebook did not accept the request.
+                item["status"] = "retry"
+                item["last_error"] = f"HTTP 429: {response_text(response)}"[:1600]
+                seconds = retry_after_seconds(response)
+                item["next_attempt_at"] = (
+                    now_utc() + timedelta(seconds=seconds or 900)
+                ).isoformat()
+                save(queue, state, cfg, f"Schedule Facebook rate-limit retry {sid}")
+                raise_hard_quota(
+                    "facebook",
+                    f"HTTP 429: {response_text(response)}",
+                    resume_at=default_cooldown_resume_at(),
+                )
+            seconds = retry_after_seconds(response)
+            item["status"] = "retry"
+            item["last_error"] = f"HTTP 429: {response_text(response)}"[:1600]
+            item["next_attempt_at"] = (
+                now_utc() + timedelta(seconds=seconds or 300)
+            ).isoformat()
+            save(queue, state, cfg, f"Schedule Facebook 429 retry {sid}")
+            print("Facebook rate limited; retry scheduled:", item["next_attempt_at"])
+            continue
+
+        if response.ok:
+            try:
+                data = response.json()
+            except ValueError as exc:
+                # A successful HTTP status without a usable post ID is still ambiguous.
+                item["status"] = "uncertain"
+                item["last_error"] = (
+                    "Facebook returned a successful HTTP status without valid JSON; "
+                    "automatic retry was blocked to avoid a duplicate Page post. "
+                    f"Parse error: {exc}"
+                )[:1600]
+                save(queue, state, cfg, f"Hold uncertain Facebook response {sid}")
+                continue
+
+            post_id = data.get("id")
+            if not post_id:
+                item["status"] = "uncertain"
+                item["last_error"] = (
+                    "Facebook returned HTTP success but no post ID; automatic retry was blocked "
+                    "to avoid a duplicate Page post."
+                )
+                save(queue, state, cfg, f"Hold missing Facebook post ID {sid}")
+                continue
+
+            clear_service_pause("facebook")
+            mark_facebook_posted(item, state, post_id)
+            save(queue, state, cfg, f"Publish Facebook post {sid}")
+            print("FACEBOOK POSTED:", post_id)
+            posted_this_run += 1
+            continue
+
+        retryable, detail = classify_facebook_error(response)
+        if retryable:
+            item["status"] = "retry"
+            item["last_error"] = detail[:1600]
+            item["next_attempt_at"] = (now_utc() + timedelta(minutes=5)).isoformat()
+            save(queue, state, cfg, f"Schedule Facebook retry {sid}")
+            continue
+
+        # Any non-429 server/transport-style response is treated as uncertain, because
+        # without a Page read endpoint we cannot safely prove that Facebook did not publish.
+        if "Uncertain Facebook" in detail or "automatic retry is blocked" in detail:
+            item["status"] = "uncertain"
+        else:
+            item["status"] = "failed"
+        item["last_error"] = detail[:1600]
+        item["next_attempt_at"] = ""
+        save(queue, state, cfg, f"Block Facebook queue item {sid}")
+        print("Facebook publish blocked:", detail)
+
+    print(f"Facebook worker complete. Posted this run: {posted_this_run}; daily total: {state['count']}/{MAX_DAILY_POSTS}")
+
+
+def runtime_preflight() -> None:
+    # These checks are intentionally explicit so an older/broken copy of the
+    # single-file script fails immediately with a useful message.
+    if "requests" not in globals():
+        raise RuntimeError("CoinSignal code is missing `import requests`.")
+    if "feedparser" not in globals():
+        raise RuntimeError("CoinSignal code is missing `import feedparser`.")
+    if "InferenceClient" not in globals():
+        raise RuntimeError("CoinSignal code is missing `InferenceClient`.")
+    if not isinstance(FB_QUEUE, Path):
+        raise RuntimeError("FB_QUEUE must be a pathlib.Path")
+    if not isinstance(QUEUE_FILE, Path):
+        raise RuntimeError("QUEUE_FILE must be a pathlib.Path")
+    if not isinstance(STATE_FILE, Path):
+        raise RuntimeError("STATE_FILE must be a pathlib.Path")
+    if not isinstance(QUOTA_STATE, Path):
+        raise RuntimeError("QUOTA_STATE must be a pathlib.Path")
+    if not isinstance(PUBLISHER_INFLIGHT, Path):
+        raise RuntimeError("PUBLISHER_INFLIGHT must be a pathlib.Path")
+    print("Runtime preflight OK:", CODE_VERSION)
+    print("feedparser loaded:", getattr(feedparser, "__version__", "unknown"))
+    print("QUEUE_FILE type:", type(QUEUE_FILE).__name__)
+    print("STATE_FILE type:", type(STATE_FILE).__name__)
+
+
+def run_selected_mode() -> None:
+    runtime_preflight()
+    mode = os.environ.get("RUN_MODE", "publish").strip().lower()
+    print("============================================================")
+    print("CoinSignal FINAL SINGLE-FILE AUTOMATION")
+    print("CODE_VERSION:", CODE_VERSION)
+    print("RUN_MODE:", mode)
+    print("============================================================")
+    if mode == "publish":
+        publisher_main()
+    elif mode == "facebook":
+        facebook_main()
+    elif mode == "both":
+        # BOTH is an explicit manual mode. Facebook may run only after the
+        # publisher phase completes normally; publisher failures must remain
+        # visible instead of being hidden by Facebook errors.
+        publisher_main()
+        facebook_main()
+    else:
+        raise NonRetryableError(f"Unsupported RUN_MODE: {mode}")
+
+
+def write_run_summary() -> None:
+    """Surface paused/stuck state in the Actions job summary instead of only logs.
+
+    HardQuotaError/ServicePauseError exit 0, so GitHub's default failure-email
+    notifications never fire for them - a day-long Gemini quota pause, or a
+    Facebook queue item stuck in "uncertain"/"failed" status (nothing auto-retries
+    those), could otherwise go unnoticed indefinitely. Best-effort only: reporting
+    problems here must never change whether the run itself succeeded or failed.
+    """
+    try:
+        summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+        if not summary_path:
+            return
+        lines = [
+            "## CoinSignal run summary",
+            f"- CODE_VERSION: `{CODE_VERSION}`",
+            f"- RUN_MODE: `{os.environ.get('RUN_MODE', '')}`",
+        ]
+
+        paused = quota_state().get("services", {})
+        lines.append("### Paused services")
+        if paused:
+            for name, entry in paused.items():
+                kind = "HARD QUOTA" if entry.get("hard_quota") else "temporary pause"
+                lines.append(
+                    f"- **{name}**: {kind}, resumes `{entry.get('resume_at') or 'unknown'}` "
+                    f"— {str(entry.get('reason', ''))[:300]}"
+                )
+        else:
+            lines.append("None.")
+
+        fb_queue = read_json(FB_QUEUE, [])
+        stuck = [
+            item for item in fb_queue
+            if isinstance(item, dict) and item.get("status") in {"uncertain", "failed"}
+        ]
+        if stuck:
+            lines.append("### Facebook queue items needing manual attention")
+            for item in stuck:
+                lines.append(
+                    f"- `{item.get('source_id', '')}` [{item.get('status')}]: "
+                    f"{str(item.get('last_error', ''))[:300]}"
+                )
+
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as exc:
+        print("Step-summary reporting warning (non-fatal):", exc)
+
+
+try:
+    run_selected_mode()
+except HardQuotaError as exc:
+    print("RUN PAUSED — HARD QUOTA:", exc)
+    write_run_summary()
+    raise SystemExit(0)
+except ServicePauseError as exc:
+    print("RUN PAUSED — SERVICE RATE LIMIT / TEMPORARY PAUSE:", exc)
+    write_run_summary()
+    raise SystemExit(0)
+except Exception as exc:
+    print("COINSIGNAL AUTOMATION ERROR:", exc)
+    write_run_summary()
+    raise
+else:
+    write_run_summary()

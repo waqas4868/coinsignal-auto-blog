@@ -1,0 +1,5 @@
+requests==2.34.2
+feedparser==6.0.14
+huggingface-hub==0.36.2
+Pillow==12.3.0
+nh3==0.3.7
