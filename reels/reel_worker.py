@@ -205,23 +205,21 @@ def main() -> int:
         update_job(queue, job, "video_ready")
         persist(queue, state, cfg, f"Reel job {reel_job_id} video ready")
 
+        page_token = fb.resolve_page_access_token(
+            cfg["FACEBOOK_PAGE_ID"], cfg["FACEBOOK_PAGE_ACCESS_TOKEN"], cfg["FACEBOOK_GRAPH_VERSION"]
+        )
+
         release_tag = f"reel-temp-{reel_job_id.lower()}"
         release = fb.upload_temp_release_asset(cfg["GITHUB_REPOSITORY"], cfg["GITHUB_TOKEN"], video_path, release_tag)
         update_job(queue, job, "upload_started")
         upload_may_have_reached_facebook = True
         try:
-            video_id = fb.start_upload_session(
-                cfg["FACEBOOK_PAGE_ID"], cfg["FACEBOOK_PAGE_ACCESS_TOKEN"], cfg["FACEBOOK_GRAPH_VERSION"]
-            )
-            fb.upload_hosted_video(
-                video_id, cfg["FACEBOOK_PAGE_ACCESS_TOKEN"], cfg["FACEBOOK_GRAPH_VERSION"], release["download_url"]
-            )
+            video_id = fb.start_upload_session(cfg["FACEBOOK_PAGE_ID"], page_token, cfg["FACEBOOK_GRAPH_VERSION"])
+            fb.upload_hosted_video(video_id, page_token, cfg["FACEBOOK_GRAPH_VERSION"], release["download_url"])
             update_job(queue, job, "upload_completed", facebook_video_id=video_id)
             persist(queue, state, cfg, f"Reel job {reel_job_id} upload completed")
 
-            phase = fb.wait_for_upload_complete(
-                video_id, cfg["FACEBOOK_PAGE_ACCESS_TOKEN"], cfg["FACEBOOK_GRAPH_VERSION"]
-            )
+            phase = fb.wait_for_upload_complete(video_id, page_token, cfg["FACEBOOK_GRAPH_VERSION"])
             update_job(queue, job, "processing")
             if phase.lower() in {"error", "failed"}:
                 raise ReelStopped(f"Facebook reported upload processing failure: {phase}")
@@ -229,7 +227,7 @@ def main() -> int:
             fb.finish_and_publish(
                 cfg["FACEBOOK_PAGE_ID"],
                 video_id,
-                cfg["FACEBOOK_PAGE_ACCESS_TOKEN"],
+                page_token,
                 cfg["FACEBOOK_GRAPH_VERSION"],
                 title=plan["title"],
                 description=plan["description"],

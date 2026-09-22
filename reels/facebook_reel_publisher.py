@@ -86,6 +86,44 @@ def cleanup_temp_release(repo: str, github_token: str, release_id: int, tag: str
         print(f"Warning: failed to delete temp tag {tag}: {exc}")
 
 
+def resolve_page_access_token(page_id: str, configured_token: str, graph_version: str) -> str:
+    """Reels requires an actual Page access token (Meta's docs: "from a user who
+    can perform the CREATE_CONTENT task on the Page"), not a raw User access
+    token. Re-implemented independently here (not imported) rather than reusing
+    scripts/coinsignal_runtime.py's resolve_page_access_token() - same reasoning
+    as everywhere else in reels/: no import coupling to the article pipeline.
+
+    If configured_token is a User token, exchange it for the matching Page's
+    token via /me/accounts. If that call fails in a way suggesting the
+    configured token is already a Page token, use it as-is.
+    """
+    try:
+        response = requests.get(
+            f"https://graph.facebook.com/{graph_version}/me/accounts",
+            params={"fields": "id,name,access_token,tasks", "limit": 100, "access_token": configured_token},
+            timeout=45,
+        )
+    except requests.RequestException as exc:
+        print(f"Reels: /me/accounts network error, using configured token as-is: {exc}")
+        return configured_token
+
+    if not response.ok:
+        print(f"Reels: /me/accounts failed ({response.status_code}), assuming configured token is already a Page token")
+        return configured_token
+
+    pages = response.json().get("data", [])
+    target = next((p for p in pages if str(p.get("id", "")).strip() == str(page_id).strip()), None)
+    if target and str(target.get("access_token", "")).strip():
+        tasks = target.get("tasks") or []
+        print(f"Reels: resolved Page token for {target.get('name')} (tasks: {', '.join(tasks) if tasks else 'none listed'})")
+        if isinstance(tasks, list) and "CREATE_CONTENT" not in tasks:
+            print("Reels WARNING: this Page role does not list CREATE_CONTENT - video publish will likely fail")
+        return str(target["access_token"]).strip()
+
+    print(f"Reels: /me/accounts succeeded but did not include page {page_id}; using configured token as-is")
+    return configured_token
+
+
 def _reels_url(page_id: str, graph_version: str) -> str:
     return f"https://graph.facebook.com/{graph_version}/{page_id}/video_reels"
 
