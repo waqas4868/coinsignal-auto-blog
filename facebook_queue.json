@@ -106,5 +106,17 @@
     "created_at": "2026-09-21T23:51:03-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "c97c57e67eb0135766d8",
+    "title": "White Hat Researchers Rescue 52 Bitcoin in Coldcard Exploit Response",
+    "summary": "White-hat security teams intercepted and evacuated 52 Bitcoin during the Coldcard exploit, moving the recovered funds to a Wyoming trust for victims.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/white-hat-researchers-rescue-52-bitcoin.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/white-hat-researchers-rescue-52-bitcoin-in-coldcard-exploit-response-c97c57e67eb0135766d8.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-22T02:33:43-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
