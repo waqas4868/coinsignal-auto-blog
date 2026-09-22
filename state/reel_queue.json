@@ -18,5 +18,15 @@
     "facebook_video_id": "",
     "updated_at": "2026-09-22T08:11:58+00:00",
     "error_reason": "Reels start failed HTTP 400: {\"error\":{\"message\":\"Error validating access token: Session has expired on Tuesday, 22-Sep-26 01:00:00 PDT. The current time is Tuesday, 22-Sep-26 01:11:57 PDT.\",\"type\":\"OAuthException\",\"code\":190,\"error_subcode\":463,\"fbtrace_id\":\"AvV_FmkUnxh2bNuiVQMjmwv\"}}"
+  },
+  {
+    "reel_job_id": "REEL-2026-09-22-NEWS-df2fe657",
+    "article_source_id": "295f393e35560d39d5e2",
+    "content_type": "news",
+    "created_at": "2026-09-22T08:20:43+00:00",
+    "state": "generating_images",
+    "facebook_video_id": "",
+    "updated_at": "2026-09-22T08:21:27+00:00",
+    "error_reason": ""
   }
 ]
