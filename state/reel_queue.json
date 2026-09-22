@@ -34,9 +34,9 @@
     "article_source_id": "92c18c3f2194c29c17ad",
     "content_type": "news",
     "created_at": "2026-09-22T08:37:15+00:00",
-    "state": "video_ready",
-    "facebook_video_id": "",
-    "updated_at": "2026-09-22T08:40:53+00:00",
+    "state": "upload_completed",
+    "facebook_video_id": "1950173775657353",
+    "updated_at": "2026-09-22T08:41:04+00:00",
     "error_reason": ""
   }
 ]
