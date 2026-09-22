@@ -60,14 +60,64 @@ migrating image hosting to an external object store with stable URLs (e.g. S3,
 Cloudflare R2), decoupled from git history size — that's a separate infra change,
 not something this pipeline does today.
 
+## Facebook Reels (`reels/`, independent system)
+
+A second, deliberately separate pipeline that turns already-published
+CoinSignal articles into short vertical Reels and posts them to the same
+Facebook Page. Runs on its own workflow
+([`.github/workflows/coinsignal_reels.yml`](.github/workflows/coinsignal_reels.yml)),
+own schedule (news Reel 17:17 Asia/Karachi, funny Reel 23:23 Asia/Karachi),
+own concurrency group, and own state files under `state/`.
+
+**Core rule: a Reel failure must never stop or damage Blogger publishing or
+the article-pipeline Facebook worker above.** `reels/reel_worker.py` never
+imports `scripts/coinsignal_runtime.py` and never writes any file outside
+`state/reel_*.json` and its own temp work directory — see
+[`reels/common.py`](reels/common.py)'s docstring for why that's structural,
+not just a convention to remember.
+
+Pipeline: pick an unreeled published article (read-only via the Blogger
+API) → Gemini writes a script + 3-5 scenes → each scene's image comes from
+[Pollinations](reels/image_generator_a.py) (free, watermarked unless
+`POLLINATIONS_TOKEN` is set) with a [Hugging Face](reels/image_generator_b.py)
+fallback → [Pillow/OpenCV](reels/image_quality_check.py) validates each
+image → [Piper](reels/voice_generator.py) synthesizes local narration
+(voice `en_US-ljspeech-medium` — deliberately not `lessac`, which is
+restricted for commercial use) → [ffmpeg](reels/video_generator.py) builds
+the vertical MP4 (zoom/pan + captions) → [ffprobe/OpenCV](reels/video_quality_check.py)
+validates it against Facebook's Reel requirements → uploaded as a
+throwaway public GitHub Release asset so Facebook's Reels API can fetch it
+by URL (deleted again immediately after) →
+[the 4-step Reels Publishing API](reels/facebook_reel_publisher.py) uploads
+and publishes it.
+
+Any technical failure (image generation exhausted, video fails validation)
+stops that Reel job only — `state/reel_queue.json` records it as `failed`
+and the workflow still exits successfully. An ambiguous outcome (e.g. a
+timeout right after upload) is recorded as `unknown`; nothing auto-retries
+an `unknown`/`failed` job, since retrying without first verifying against
+Facebook's own status risks a duplicate post — same philosophy as the
+article pipeline's Facebook `uncertain` state.
+
+No new required secrets — it reuses the existing Facebook, Blogger, Google
+OAuth, Gemini, and Hugging Face secrets. `POLLINATIONS_TOKEN` and
+`NTFY_URL` are both optional.
+
 ## Local development
 
 ```bash
 pip install -r requirements.txt
 python -m py_compile scripts/coinsignal_runtime.py
+python -m py_compile reels/*.py
 ```
 
-Running the script for real requires the same environment variables the workflow
-sets from secrets (`GEMINI_API_KEY`, `BLOGGER_BLOG_ID`, `GOOGLE_CLIENT_ID`,
-`GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `HF_TOKEN`, `FACEBOOK_PAGE_ID`,
+Running `scripts/coinsignal_runtime.py` for real requires the same
+environment variables the workflow sets from secrets (`GEMINI_API_KEY`,
+`BLOGGER_BLOG_ID`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
+`GOOGLE_REFRESH_TOKEN`, `HF_TOKEN`, `FACEBOOK_PAGE_ID`,
 `FACEBOOK_PAGE_ACCESS_TOKEN`) plus `RUN_MODE=publish|facebook|both`.
+Running `reels/reel_worker.py` needs the same Blogger/Google/Gemini/HF/
+Facebook variables plus `GITHUB_TOKEN` (a token with `repo` scope on this
+repository) and `REEL_TYPE=news|funny`. `ffmpeg`/`ffprobe` must be on
+`PATH`; Piper downloads its voice model on first run into
+`reels/.piper_voices/`.

@@ -3,3 +3,6 @@ feedparser==6.0.14
 huggingface-hub==0.36.2
 Pillow==12.3.0
 nh3==0.3.7
+opencv-python-headless==4.14.0.94
+piper-tts==1.8.0
+numpy==2.3.3

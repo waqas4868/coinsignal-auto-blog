@@ -1,0 +1,107 @@
+# CoinSignal Reels workflow - deliberately independent from blogger.yml.
+#
+# A Reel failure must never stop or damage Blogger article publishing or the
+# existing Facebook image-post worker: separate concurrency group, separate
+# schedule, separate state files (state/reel_*.json vs the article
+# pipeline's root-level JSON files), and reels/reel_worker.py never imports
+# scripts/coinsignal_runtime.py. See reels/common.py for details.
+name: CoinSignal Reels
+
+on:
+  workflow_dispatch:
+    inputs:
+      reel_type:
+        description: "Reel content type"
+        required: true
+        default: news
+        type: choice
+        options:
+          - news
+          - funny
+  schedule:
+    # News Reel: 17:17 Asia/Karachi (fixed UTC+5, no DST) = 12:17 UTC
+    - cron: "17 12 * * *"
+    # Funny Reel: 23:23 Asia/Karachi = 18:23 UTC
+    - cron: "23 18 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: coinsignal-reels-writer
+  cancel-in-progress: false
+
+env:
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
+  GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+  GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+  GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+  FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+  FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+  FACEBOOK_GRAPH_VERSION: ${{ vars.FACEBOOK_GRAPH_VERSION }}
+  POLLINATIONS_TOKEN: ${{ secrets.POLLINATIONS_TOKEN }}
+  NTFY_URL: ${{ secrets.NTFY_URL }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Ensure ffmpeg is installed
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Select reel type
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "REEL_TYPE=${{ github.event.inputs.reel_type }}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          case "${{ github.event.schedule }}" in
+            "17 12 * * *")
+              echo "REEL_TYPE=news" >> "$GITHUB_ENV"
+              ;;
+            "23 18 * * *")
+              echo "REEL_TYPE=funny" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "Unsupported schedule: ${{ github.event.schedule }}"
+              exit 1
+              ;;
+          esac
+
+      - name: Restore Piper voice model cache
+        uses: actions/cache@v4
+        with:
+          path: reels/.piper_voices
+          key: piper-voice-en_US-ljspeech-medium-v1
+
+      - name: Run CoinSignal Reel worker
+        run: python reels/reel_worker.py

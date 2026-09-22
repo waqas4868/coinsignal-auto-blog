@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
+.testvenv/
 publisher_inflight.json
+reels/.piper_voices/
