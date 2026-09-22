@@ -24,9 +24,9 @@
     "article_source_id": "295f393e35560d39d5e2",
     "content_type": "news",
     "created_at": "2026-09-22T08:20:43+00:00",
-    "state": "video_ready",
+    "state": "unknown",
     "facebook_video_id": "",
-    "updated_at": "2026-09-22T08:24:03+00:00",
-    "error_reason": ""
+    "updated_at": "2026-09-22T08:24:10+00:00",
+    "error_reason": "Reels start failed HTTP 403: {\"error\":{\"message\":\"(#200) Subject does not have permission to post videos on this target\",\"type\":\"OAuthException\",\"code\":200,\"fbtrace_id\":\"Abnyy21ohXSjCoWSYRIXVJk\"}}"
   }
 ]
