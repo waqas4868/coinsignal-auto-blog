@@ -158,6 +158,7 @@ def main() -> int:
         "updated_at": iso_now(),
         "error_reason": "",
     }
+    upload_may_have_reached_facebook = False
 
     try:
         token = reel_planner.refresh_google_token(
@@ -207,6 +208,7 @@ def main() -> int:
         release_tag = f"reel-temp-{reel_job_id.lower()}"
         release = fb.upload_temp_release_asset(cfg["GITHUB_REPOSITORY"], cfg["GITHUB_TOKEN"], video_path, release_tag)
         update_job(queue, job, "upload_started")
+        upload_may_have_reached_facebook = True
         try:
             video_id = fb.start_upload_session(
                 cfg["FACEBOOK_PAGE_ID"], cfg["FACEBOOK_PAGE_ACCESS_TOKEN"], cfg["FACEBOOK_GRAPH_VERSION"]
@@ -249,13 +251,21 @@ def main() -> int:
         notify(f"CoinSignal Reel failed ❌: {exc}")
         return 0
     except Exception as exc:
-        print("REEL UNKNOWN/UNEXPECTED ERROR (article pipeline unaffected):", exc)
-        update_job(queue, job, "unknown", error_reason=str(exc))
+        # Only mark "unknown" (blocks auto-retry of this article until a human
+        # verifies against Facebook) once we've actually started talking to the
+        # Reels API - a failure before that point (Gemini hiccup, image/video
+        # generation bug) can never have posted anything, so the next scheduled
+        # run is free to try this same article again from scratch. Exit code
+        # stays non-zero either way (genuinely unexpected error) so it's
+        # visible in the Actions UI - that's independent of retry-safety.
+        outcome_state = "unknown" if upload_may_have_reached_facebook else "failed"
+        print(f"REEL ERROR, state={outcome_state} (article pipeline unaffected):", exc)
+        update_job(queue, job, outcome_state, error_reason=str(exc))
         try:
-            persist(queue, state, cfg, f"Reel job {reel_job_id} unknown error: {exc}")
+            persist(queue, state, cfg, f"Reel job {reel_job_id} {outcome_state}: {exc}")
         except Exception as persist_exc:
             print("Additionally failed to persist reel state:", persist_exc)
-        notify(f"CoinSignal Reel upload unknown ⚠️: verification required")
+        notify(f"CoinSignal Reel error ({outcome_state}) ⚠️: {exc}")
         raise
 
 

@@ -14,9 +14,13 @@ import json
 import re
 from typing import Any
 
+import time
+
 import requests
 
-from common import read_json, REEL_QUEUE_PATH
+from common import backoff_seconds, read_json, REEL_QUEUE_PATH
+
+RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 
 BLOGGER_API = "https://www.googleapis.com/blogger/v3"
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
@@ -161,6 +165,32 @@ Return ONLY JSON matching the requested schema.
 """.strip()
 
 
+def _call_gemini_with_retry(url: str, headers: dict[str, str], payload: dict[str, Any], attempts: int = 4) -> dict[str, Any]:
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=180)
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            if attempt < attempts:
+                time.sleep(backoff_seconds(attempt))
+                continue
+            raise RuntimeError(f"Gemini reel-plan request failed after retries: {last_error}")
+
+        if response.ok:
+            return response.json()
+
+        if response.status_code in RETRYABLE_HTTP and attempt < attempts:
+            last_error = f"HTTP {response.status_code}: {response.text[:500]}"
+            print(f"Gemini reel-plan attempt {attempt}/{attempts} retryable failure: {last_error}")
+            time.sleep(backoff_seconds(attempt))
+            continue
+
+        raise RuntimeError(f"Gemini reel-plan request failed HTTP {response.status_code}: {response.text[:1000]}")
+
+    raise RuntimeError(f"Gemini reel-plan request failed after retries: {last_error}")
+
+
 def generate_reel_plan(article: dict[str, Any], content_type: str, gemini_api_key: str, gemini_model: str) -> dict[str, Any]:
     prompt = _build_prompt(article, content_type)
     url = f"{GEMINI_API}/models/{gemini_model}:generateContent"
@@ -171,16 +201,9 @@ def generate_reel_plan(article: dict[str, Any], content_type: str, gemini_api_ke
             "responseSchema": NEWS_SCHEMA,
         },
     }
-    response = requests.post(
-        url,
-        headers={"x-goog-api-key": gemini_api_key, "Content-Type": "application/json"},
-        json=payload,
-        timeout=180,
+    payload_json = _call_gemini_with_retry(
+        url, {"x-goog-api-key": gemini_api_key, "Content-Type": "application/json"}, payload
     )
-    if not response.ok:
-        raise RuntimeError(f"Gemini reel-plan request failed HTTP {response.status_code}: {response.text[:1000]}")
-
-    payload_json = response.json()
     candidate = payload_json.get("candidates", [{}])[0]
     parts = candidate.get("content", {}).get("parts", [])
     text = next((p.get("text") for p in parts if isinstance(p, dict) and p.get("text")), None)
