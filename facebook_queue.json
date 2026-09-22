@@ -142,5 +142,17 @@
     "created_at": "2026-09-22T10:39:19-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "24b38411fad48033756e",
+    "title": "Bitcoin Price Eyes $86K Support Following Oil Market Decline",
+    "summary": "Bitcoin price holds near $86,000 as support after crude oil drops below $90, driven by geopolitical developments involving the US and Iran.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/bitcoin-price-eyes-86k-support.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/bitcoin-price-eyes-86k-support-following-oil-market-decline-24b38411fad48033756e.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-22T13:03:00-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
