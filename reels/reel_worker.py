@@ -212,9 +212,13 @@ def main() -> int:
         release_tag = f"reel-temp-{reel_job_id.lower()}"
         release = fb.upload_temp_release_asset(cfg["GITHUB_REPOSITORY"], cfg["GITHUB_TOKEN"], video_path, release_tag)
         update_job(queue, job, "upload_started")
-        upload_may_have_reached_facebook = True
         try:
+            # start_upload_session only creates an empty video session (no bytes
+            # sent yet) - a failure here can't have posted anything, so it's safe
+            # to retry from scratch. Only upload_hosted_video onward can actually
+            # transmit content to Facebook, so that's where "unknown" begins.
             video_id = fb.start_upload_session(cfg["FACEBOOK_PAGE_ID"], page_token, cfg["FACEBOOK_GRAPH_VERSION"])
+            upload_may_have_reached_facebook = True
             fb.upload_hosted_video(video_id, page_token, cfg["FACEBOOK_GRAPH_VERSION"], release["download_url"])
             update_job(queue, job, "upload_completed", facebook_video_id=video_id)
             persist(queue, state, cfg, f"Reel job {reel_job_id} upload completed")
