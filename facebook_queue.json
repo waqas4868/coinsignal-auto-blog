@@ -118,5 +118,17 @@
     "created_at": "2026-09-22T02:33:43-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "3075e6fffbe44bd04370",
+    "title": "Does Satoshi Nakamoto Actually Own 1.1 Million Bitcoin?",
+    "summary": "Researchers have traced 1.1 million BTC to a distinctive early mining operation. However, proving that this miner was Satoshi Nakamoto remains a challenge.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/does-satoshi-nakamoto-actually-own-11.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/does-satoshi-nakamoto-actually-own-1-1-million-bitcoin-3075e6fffbe44bd04370.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-22T06:45:06-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
