@@ -10,6 +10,16 @@
 
     Coordinates on each <g> are LOCAL offsets from the immediate parent's
     origin (not canvas-absolute) - standard nested-rig convention.
+
+    LEFT/RIGHT CONVENTION (documented explicitly to avoid ambiguity once
+    scene logic references "left arm"/"right arm"): "left"/"right" in every
+    id is VIEWER/SCREEN perspective, not the character's own anatomical
+    left/right. alex-left-* is always the screen-left side as drawn here
+    (character facing the viewer). This matches how a 2D scene author will
+    think about layout ("Alex's left arm points toward the chart on the
+    left of frame"), not mirror-anatomy. If a future pose ever turns the
+    character around, this convention must be resolved explicitly then -
+    do not silently flip it.
   -->
   <g id="alex-style" stroke="#1a1a1a" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none">
 
