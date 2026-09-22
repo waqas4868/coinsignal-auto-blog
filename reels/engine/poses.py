@@ -83,10 +83,20 @@ POSES: dict[str, dict[str, float]] = {
 
 def apply_pose(rig, pose_name: str) -> list[str]:
     """Applies a named pose to rig (a reels.engine.rig.Rig). Returns any
-    clamp warnings so callers can decide whether to log/report them."""
+    clamp warnings so callers can decide whether to log/report them.
+
+    Always resets every joint to rest (0 deg) first, THEN applies the named
+    pose's overrides - a pose like "idle" that lists no joints must mean
+    "rest pose", not "whatever the rig happened to be posed as before this
+    call". Without this reset, reusing one Rig/Performance across multiple
+    render_at(t) calls (as Scene.render_frame does, once per actor) leaks
+    stale angles from an earlier frame's pose into a later frame that never
+    asked for them - confirmed by an actual scene render where "idle" after
+    "point" kept the arm extended (see conversation).
+    """
     if pose_name not in POSES:
         raise ValueError(f"Unknown pose {pose_name!r}. Known poses: {sorted(POSES)}")
-    rig.clamped_this_pose = []
+    rig.reset_pose()
     for suffix, angle in POSES[pose_name].items():
         rig.set_angle(f"{rig.character}-{suffix}", angle)
     return list(rig.clamped_this_pose)
