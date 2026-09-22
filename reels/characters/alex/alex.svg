@@ -48,10 +48,12 @@
             </g>
 
             <g id="alex-left-eye" transform="translate(-25,-70)">
-              <circle r="6" fill="#1a1a1a" stroke="none"/>
+              <circle class="eye-open" r="6" fill="#1a1a1a" stroke="none"/>
+              <path class="eye-closed" d="M -7,1 Q 0,-6 7,1" stroke="#1a1a1a" stroke-width="3" fill="none" display="none"/>
             </g>
             <g id="alex-right-eye" transform="translate(25,-70)">
-              <circle r="6" fill="#1a1a1a" stroke="none"/>
+              <circle class="eye-open" r="6" fill="#1a1a1a" stroke="none"/>
+              <path class="eye-closed" d="M -7,1 Q 0,-6 7,1" stroke="#1a1a1a" stroke-width="3" fill="none" display="none"/>
             </g>
 
             <g id="alex-mouth" transform="translate(0,-42)">

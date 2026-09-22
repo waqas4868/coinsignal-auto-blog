@@ -12,6 +12,7 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from expressions import apply_expression
 from joints import IK_CHAINS, JOINT_LIMITS, clamp_angle
 
 SVG_NS = "http://www.w3.org/2000/svg"
@@ -111,6 +112,9 @@ class Rig:
             else:
                 el.set("transform", f"translate({tx},{ty}) rotate({angle:.3f})")
         return self.tree
+
+    def set_expression(self, expression_name: str) -> None:
+        apply_expression(self._elements, expression_name)
 
     def save(self, output_path: Path) -> Path:
         self.apply()
