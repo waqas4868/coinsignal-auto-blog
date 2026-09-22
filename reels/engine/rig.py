@@ -12,7 +12,7 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from expressions import apply_expression
+from expressions import apply_expression, MOUTH_SHAPES
 from joints import IK_CHAINS, JOINT_LIMITS, clamp_angle
 
 SVG_NS = "http://www.w3.org/2000/svg"
@@ -115,6 +115,47 @@ class Rig:
 
     def set_expression(self, expression_name: str) -> None:
         apply_expression(self._elements, expression_name)
+
+    # --- Layering primitives (Phase 5): each ADDS to or OVERRIDES one
+    # specific channel without touching the others, so multiple concerns
+    # (base pose, breathing, gaze, blink, talk) can compose in one frame
+    # instead of each fully overwriting the last. ---
+
+    def nudge_angle(self, joint_id: str, delta_degrees: float) -> float:
+        """Adds delta to whatever angle is already set (e.g. by a pose or an
+        earlier layer) rather than replacing it - still clamped."""
+        current = self.pose.get(joint_id, 0.0)
+        return self.set_angle(joint_id, current + delta_degrees)
+
+    def add_eye_offset(self, dx: float) -> None:
+        """Appends a small extra translate to each eye's CURRENT transform
+        (whatever set_expression already produced) - must be called after
+        set_expression() in the composition order, not before."""
+        for eye_id in ("alex-left-eye", "alex-right-eye"):
+            el = self._elements[eye_id]
+            current = el.get("transform", "")
+            el.set("transform", f"{current} translate({dx:.2f},0)".strip())
+
+    def force_eyes_closed(self, closed: bool) -> None:
+        """Blink override: only forces CLOSED when closed=True. Does nothing
+        when False, so an expression that already wants closed eyes (e.g.
+        "laughing") isn't fought by an inactive blink."""
+        if not closed:
+            return
+        for eye_id in ("alex-left-eye", "alex-right-eye"):
+            el = self._elements[eye_id]
+            open_el = el.find(f"{{{SVG_NS}}}circle[@class='eye-open']")
+            closed_el = el.find(f"{{{SVG_NS}}}path[@class='eye-closed']")
+            if open_el is not None and closed_el is not None:
+                open_el.set("display", "none")
+                closed_el.set("display", "inline")
+
+    def override_mouth(self, shape_key: str) -> None:
+        """Talk override: replaces whatever set_expression put in the mouth
+        path with a viseme shape, independent of eyebrows/eyes."""
+        mouth_group = self._elements["alex-mouth"]
+        mouth_path = mouth_group.find(f"{{{SVG_NS}}}path")
+        mouth_path.set("d", MOUTH_SHAPES[shape_key])
 
     def save(self, output_path: Path) -> Path:
         self.apply()

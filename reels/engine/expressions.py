@@ -29,6 +29,14 @@ MOUTH_SHAPES = {
     "frown": "M -16,4 Q 0,-8 16,4",
     "open_shock": "M -13,-2 Q -13,16 0,16 Q 13,16 13,-2 Q 13,-10 0,-10 Q -13,-10 -13,-2 Z",
     "smirk": "M -16,2 Q 4,12 18,-2",
+    # Visemes (talking mouth-openness states, Phase 5) - independent of the
+    # emotional shapes above; deliberately distinct geometry per openness
+    # level, not a scale of one shape, so they stay readable at this line
+    # weight (same lesson as the "laughing" eyes fix - see conversation).
+    "viseme_closed": "M -14,0 L 14,0",
+    "viseme_small": "M -12,2 Q 0,8 12,2 Q 0,4 -12,2",
+    "viseme_open": "M -14,-2 Q 0,14 14,-2 Q 0,6 -14,-2",
+    "viseme_wide": "M -18,-2 Q 0,18 18,-2 Q 0,8 -18,-2",
 }
 
 
