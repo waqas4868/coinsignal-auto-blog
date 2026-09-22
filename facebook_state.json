@@ -1,15 +1,17 @@
 {
   "date": "2026-09-22",
-  "count": 0,
+  "count": 1,
   "posted_source_ids": [
     "b7351036093a8fa02535",
     "a380232311eb3d988d98",
-    "6686efe8d004e844905e"
+    "6686efe8d004e844905e",
+    "72da260becdf20ed9200"
   ],
   "posted_urls": [
     "https://blogsdrip4u.blogspot.com/2026/09/x-files-lawsuit-against-bitcoin-account.html",
     "https://blogsdrip4u.blogspot.com/2026/09/near-protocol-jumps-80-weekly-as-near.html",
-    "https://blogsdrip4u.blogspot.com/2026/09/strategy-resumes-bitcoin-purchases-with.html"
+    "https://blogsdrip4u.blogspot.com/2026/09/strategy-resumes-bitcoin-purchases-with.html",
+    "https://blogsdrip4u.blogspot.com/2026/09/clarity-act-stalls-as-coinbase-faces.html"
   ],
   "posts": [
     {
@@ -32,6 +34,13 @@
       "post_id": "1230937780113012_122104011441480923",
       "recovered": false,
       "time": "2026-09-21T14:16:15.907649+00:00"
+    },
+    {
+      "source_id": "72da260becdf20ed9200",
+      "url": "https://blogsdrip4u.blogspot.com/2026/09/clarity-act-stalls-as-coinbase-faces.html",
+      "post_id": "1230937780113012_122104733397480923",
+      "recovered": false,
+      "time": "2026-09-22T06:53:00.951186+00:00"
     }
   ]
 }
