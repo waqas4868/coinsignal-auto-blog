@@ -94,5 +94,17 @@
     "created_at": "2026-09-21T22:53:47-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "7dbecc13a7857dd3bf9d",
+    "title": "Trueo Prediction Market Migrates from Base to Ethereum Mainnet",
+    "summary": "Decentralized prediction market platform Trueo transitions from Base to Ethereum mainnet, prioritizing integration potential over Layer-2 gas fee savings.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/trueo-prediction-market-migrates-from.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/trueo-prediction-market-migrates-from-base-to-ethereum-mainnet-7dbecc13a7857dd3bf9d.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-21T23:51:03-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
