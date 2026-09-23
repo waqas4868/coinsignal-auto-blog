@@ -238,5 +238,17 @@
     "created_at": "2026-09-23T11:29:01-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "3ba52b14428e27d8edfc",
+    "title": "Bitcoin Long Liquidations Reach $280M as BTC Price Dips Below $84K",
+    "summary": "Bitcoin long liquidations surged to $280 million after BTC briefly dropped under $84,000, testing critical support levels in the market.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/bitcoin-long-liquidations-reach-280m-as.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/bitcoin-long-liquidations-reach-280m-as-btc-price-dips-below-84k-3ba52b14428e27d8edfc.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-23T11:30:50-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
