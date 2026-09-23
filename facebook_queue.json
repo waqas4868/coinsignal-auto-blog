@@ -166,5 +166,17 @@
     "created_at": "2026-09-22T16:31:08-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "7d7d791f622e1432a71d",
+    "title": "FomoPeek iOS App Linked to $580,000 Crypto Theft via Kernel Exploit",
+    "summary": "A malicious iOS app named FomoPeek bypassed App Store security using kernel exploits to steal $580,000, according to security firm SlowMist.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/fomopeek-ios-app-linked-to-580000.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/fomopeek-ios-app-linked-to-580-000-crypto-theft-via-kernel-exploit-7d7d791f622e1432a71d.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-22T22:33:30-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
