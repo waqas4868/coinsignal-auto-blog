@@ -226,5 +226,17 @@
     "created_at": "2026-09-23T11:26:17-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "43be4d90beeb70640da9",
+    "title": "Visa Survey: Bank-Like Protections Could Boost US Stablecoin Adoption",
+    "summary": "A Visa survey indicates US stablecoin adoption could surge if bank-level protections are introduced as companies prepare for the GENIUS Act.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/visa-survey-bank-like-protections-could.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/visa-survey-bank-like-protections-could-boost-us-stablecoin-adoption-43be4d90beeb70640da9.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-23T11:29:01-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
