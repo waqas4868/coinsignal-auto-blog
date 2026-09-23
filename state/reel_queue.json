@@ -68,5 +68,15 @@
     "facebook_video_id": "",
     "updated_at": "2026-09-23T17:05:07+00:00",
     "error_reason": "Gemini reel-plan request failed HTTP 503: {\n  \"error\": {\n    \"code\": 503,\n    \"message\": \"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\n    \"status\": \"UNAVAILABLE\"\n  }\n}\n"
+  },
+  {
+    "reel_job_id": "REEL-2026-09-23-FUNNY-4aa15036",
+    "article_source_id": "b19c0a17d725dffabed9",
+    "content_type": "funny",
+    "created_at": "2026-09-23T21:37:15+00:00",
+    "state": "generating_images",
+    "facebook_video_id": "",
+    "updated_at": "2026-09-23T21:37:28+00:00",
+    "error_reason": ""
   }
 ]
