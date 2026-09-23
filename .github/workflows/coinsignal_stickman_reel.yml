@@ -1,0 +1,122 @@
+# CoinSignal stickman Reel pipeline - Master Handoff 2026-09-23 (funny/
+# meme-style, 2.3-minute Reel). Deliberately independent from blogger.yml
+# and coinsignal_reels.yml: its own concurrency group, its own state files
+# (state/reel_daily_selection.json, reels/queue/facebook_reel_queue.json),
+# no shared code imports with either pipeline - see reels/common.py.
+#
+# workflow_dispatch ONLY - no schedule trigger yet. This workflow will
+# never run on its own until a `schedule:` block is deliberately added,
+# same discipline every other live integration in this project followed:
+# manual trigger first, proven, schedule added only after.
+#
+# Facebook publishing defaults to a DRY RUN (publish_facebook_reel.py's
+# own gate, independent of this workflow) - it only goes live if the
+# REEL_PUBLISH_LIVE repository variable is explicitly set to "true".
+name: CoinSignal Stickman Reel Pipeline
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: coinsignal-stickman-reel-writer
+  cancel-in-progress: false
+
+env:
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
+  GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+  GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+  GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+  FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+  FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+  FACEBOOK_GRAPH_VERSION: ${{ vars.FACEBOOK_GRAPH_VERSION }}
+  POLLINATIONS_TOKEN: ${{ secrets.POLLINATIONS_TOKEN }}
+  # Both default OFF (unset). Only set these once real credentials AND a
+  # deliberate decision to accept billing exist - see scene_video_provider.py
+  # / scene_voice_provider.py for why each is gated behind its own flag.
+  ALLOW_PAID_VIDEO_PROVIDERS: ${{ vars.ALLOW_PAID_VIDEO_PROVIDERS }}
+  ALLOW_PAID_VOICE_PROVIDERS: ${{ vars.ALLOW_PAID_VOICE_PROVIDERS }}
+  ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+  ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
+  # Default OFF (unset) - see publish_facebook_reel.py. Must be set to the
+  # literal string "true" as a repository variable to ever publish live.
+  REEL_PUBLISH_LIVE: ${{ vars.REEL_PUBLISH_LIVE }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Ensure ffmpeg is installed
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Restore Piper voice model cache
+        uses: actions/cache@v4
+        with:
+          path: reels/.piper_voices
+          key: piper-voice-en_US-ljspeech-medium-v1
+
+      - name: Download Piper voice model if not cached
+        run: |
+          mkdir -p reels/.piper_voices
+          if [ ! -f reels/.piper_voices/en_US-ljspeech-medium.onnx ]; then
+            python -m piper.download_voices en_US-ljspeech-medium --download-dir reels/.piper_voices
+          fi
+
+      - name: Compute today's PKT date
+        id: pkt_date
+        run: echo "date=$(TZ=Asia/Karachi date +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Reel job working directory
+        # Holds this specific day's scene images/videos/voice clips and
+        # final render - large, ephemeral, multi-run-resumable working
+        # data that deliberately never goes into git (same reasoning
+        # facebook_reel_publisher.py hosts its video as a temporary GitHub
+        # Release asset instead of a commit - see
+        # run_daily_pipeline_entrypoint.py's docstring). A fresh unique key
+        # per run avoids overwriting a still-good cache entry if this run
+        # fails; restore-keys picks up the most recent same-day entry.
+        uses: actions/cache/restore@v4
+        with:
+          path: reels/jobs/${{ steps.pkt_date.outputs.date }}
+          key: reel-jobs-${{ steps.pkt_date.outputs.date }}-${{ github.run_id }}
+          restore-keys: |
+            reel-jobs-${{ steps.pkt_date.outputs.date }}-
+
+      - name: Run CoinSignal stickman Reel pipeline
+        run: python reels/run_daily_pipeline_entrypoint.py
+
+      - name: Save Reel job working directory
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: reels/jobs/${{ steps.pkt_date.outputs.date }}
+          key: reel-jobs-${{ steps.pkt_date.outputs.date }}-${{ github.run_id }}
