@@ -183,7 +183,16 @@ def render_scene_clip(
             "-filter_complex", filter_complex,
             "-map", "[v]", "-map", "1:a",
             "-t", f"{timing['output_duration']:.3f}",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+            # "ultrafast": isolated and confirmed this phase that libx264's
+            # default "medium" preset (its larger lookahead/motion-estimation
+            # buffers) can fail outright under real memory pressure ("malloc
+            # of size 7186688 failed") where "ultrafast" succeeds under the
+            # identical conditions - and CI runners are memory/time-
+            # constrained too, encoding up to 23 scenes sequentially within a
+            # workflow timeout. The content here (flat, minimal-color
+            # stickman line art) has little to lose from lower compression
+            # effort, unlike typical photographic/video content.
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-r", "30",
             "-c:a", "aac", "-ar", "44100", "-shortest",
             str(output_path),
         ]

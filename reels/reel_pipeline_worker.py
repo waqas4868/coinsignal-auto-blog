@@ -95,19 +95,27 @@ def run_daily_pipeline(
     generate_part_fn: Callable = reel_story.generate_part_via_gemini,
     image_providers: list | None = None,
     video_providers: list | None = None,
+    voice_providers: list | None = None,
     voice_model_path: Path | None = None,
     publish_kwargs: dict[str, Any] | None = None,
     jobs_dir: Path = JOBS_DIR,
+    selection_state_path: Path = REEL_DAILY_SELECTION_PATH,
+    queue_path: Path = queue_mod.QUEUE_PATH,
 ) -> dict[str, Any]:
     """Advances the daily Reel job as far as currently possible and returns
     a status report. Never regenerates already-completed work (every stage
     below delegates to a phase module whose own idempotency guarantee is
     already tested independently - see that phase's own test file).
+
+    selection_state_path/queue_path default to the real production files
+    but are overridable so this can be exercised end-to-end against a
+    throwaway sandbox (see the Phase 12 dry-run test) without touching
+    this repo's actual state/ or reels/queue/ files.
     """
     date = date or pkt_date()
     job_dir = jobs_dir / date
 
-    selection = article_selector.load_selection(date)
+    selection = article_selector.load_selection(date, selection_state_path)
     if selection is None or selection.get("reel_status") != "SELECTED":
         return {"stage": "NOT_READY", "date": date, "detail": "fewer than 6 same-day Blogger articles so far"}
 
@@ -135,7 +143,7 @@ def run_daily_pipeline(
     image_providers = image_providers or scene_image_provider.default_providers(os.environ.get("HF_TOKEN", ""))
     video_providers = video_providers or scene_video_provider.default_providers(job_dir / "video_manifest.json")
     voice_model_path = voice_model_path or (Path(__file__).resolve().parent / ".piper_voices" / "en_US-ljspeech-medium.onnx")
-    voice_providers = scene_voice_provider.default_providers(voice_model_path)
+    voice_providers = voice_providers or scene_voice_provider.default_providers(voice_model_path)
 
     video_states, voice_states = [], []
     for scene in scenes:
@@ -168,7 +176,7 @@ def run_daily_pipeline(
     render_state = read_json(job_dir / "render_state.json", None)
     render_state = render_state if isinstance(render_state, dict) else None
 
-    queue = queue_mod.load_queue()
+    queue = queue_mod.load_queue(queue_path)
     queue_job = queue_mod.find_job(queue, job_id)
 
     stage = determine_next_stage(
@@ -200,13 +208,13 @@ def run_daily_pipeline(
             source_article_url=selection["reel_source_article_url"], source_article_title=selection["reel_source_article_title"],
             video_path=render_state["path"], caption=scenes[0]["voiceover"],
         )
-        queue_mod.save_queue(queue)
+        queue_mod.save_queue(queue, queue_path)
         return {"stage": "ENQUEUE", "date": date, "job_id": job_id, "job": job}
 
     if stage == "PUBLISH":
         kwargs = publish_kwargs or {}
         result = publish_facebook_reel.publish_reel_job(queue_job, **kwargs)
-        queue_mod.save_queue(queue)
+        queue_mod.save_queue(queue, queue_path)
         return {"stage": "PUBLISH", "date": date, "job_id": job_id, "publish": result}
 
     return {"stage": "DONE", "date": date, "job_id": job_id}
