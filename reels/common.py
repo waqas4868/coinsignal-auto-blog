@@ -15,10 +15,21 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+
+PKT = ZoneInfo("Asia/Karachi")
 
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def now_pkt() -> datetime:
+    return datetime.now(PKT)
+
+
+def pkt_date() -> str:
+    return now_pkt().strftime("%Y-%m-%d")
 
 
 def iso_now() -> str:
@@ -88,6 +99,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = REPO_ROOT / "state"
 REEL_QUEUE_PATH = STATE_DIR / "reel_queue.json"
 REEL_STATE_PATH = STATE_DIR / "reel_state.json"
+REEL_DAILY_SELECTION_PATH = STATE_DIR / "reel_daily_selection.json"
 WORK_DIR = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "coinsignal_reel_work"
 
 
