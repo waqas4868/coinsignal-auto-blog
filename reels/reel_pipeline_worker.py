@@ -116,8 +116,22 @@ def run_daily_pipeline(
     job_dir = jobs_dir / date
 
     selection = article_selector.load_selection(date, selection_state_path)
+    if selection is None:
+        # No persisted selection yet for this date - this is the ONLY
+        # place anything ever performs the live Blogger fetch + selection
+        # (a real bug found in production: this call was missing entirely,
+        # so the pipeline reported NOT_READY forever regardless of how
+        # many articles actually existed, since load_selection() alone is
+        # a pure local file read and nothing else ever writes that file).
+        selection = article_selector.run_selection_for_today(date, selection_state_path)
     if selection is None or selection.get("reel_status") != "SELECTED":
-        return {"stage": "NOT_READY", "date": date, "detail": "fewer than 6 same-day Blogger articles so far"}
+        detail = selection.get("detail") if isinstance(selection, dict) else None
+        articles_available = selection.get("articles_available") if isinstance(selection, dict) else None
+        return {
+            "stage": "NOT_READY",
+            "date": date,
+            "detail": detail or f"fewer than 6 same-day Blogger articles so far ({articles_available if articles_available is not None else '?'}/6)",
+        }
 
     job_id = make_job_id(date, selection["reel_source_article_id"])
 

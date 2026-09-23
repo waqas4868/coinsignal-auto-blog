@@ -195,8 +195,11 @@ def fetch_recent_blogger_posts(blog_id: str, access_token: str, max_results: int
     return response.json().get("items", [])
 
 
-def run_selection_for_today() -> dict[str, Any]:
-    """Live entrypoint: fetches today's PKT-date Blogger posts and selects.
+def run_selection_for_today(
+    target_date: str | None = None, state_path: Path = REEL_DAILY_SELECTION_PATH
+) -> dict[str, Any]:
+    """Live entrypoint: fetches target_date's (default: today's PKT date)
+    Blogger posts and selects.
 
     Uses the same GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN + BLOGGER_BLOG_ID
     secrets already configured for the article pipeline and the existing
@@ -204,10 +207,11 @@ def run_selection_for_today() -> dict[str, Any]:
     """
     from common import pkt_date
 
+    target_date = target_date or pkt_date()
     env = require_env("BLOGGER_BLOG_ID", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN")
     token = refresh_google_token(env["GOOGLE_CLIENT_ID"], env["GOOGLE_CLIENT_SECRET"], env["GOOGLE_REFRESH_TOKEN"])
     posts = fetch_recent_blogger_posts(env["BLOGGER_BLOG_ID"], token)
-    return select_for_date(posts, pkt_date())
+    return select_for_date(posts, target_date, state_path=state_path)
 
 
 if __name__ == "__main__":
