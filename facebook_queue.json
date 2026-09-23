@@ -214,5 +214,17 @@
     "created_at": "2026-09-23T10:48:12-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "c1f9862656708f76b4ed",
+    "title": "NYSE and Blockchain.com Partner to Explore Tokenized US Equities",
+    "summary": "The New York Stock Exchange and Blockchain.com are teaming up to potentially bring tokenized US stocks and ETFs to digital asset users.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/nyse-and-blockchaincom-partner-to.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/nyse-and-blockchain-com-partner-to-explore-tokenized-us-equities-c1f9862656708f76b4ed.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-23T11:26:17-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
