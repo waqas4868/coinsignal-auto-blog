@@ -50,6 +50,7 @@ class BloggerArticle:
     title: str
     summary: str
     published_at: str  # raw Blogger ISO 8601 timestamp
+    content_html: str  # full post content, as returned by the Blogger API (fetchBodies=true)
 
 
 def _decode_meta(blob: str) -> dict[str, Any] | None:
@@ -100,6 +101,7 @@ def articles_for_date(posts: list[dict[str, Any]], target_date: str, tz: ZoneInf
                 title=str(post.get("title", "")).strip(),
                 summary=str((meta or {}).get("summary", "")),
                 published_at=published,
+                content_html=str(post.get("content", "")),
             )
         )
     out.sort(key=lambda a: (a.published_at, a.source_id))
@@ -149,6 +151,7 @@ def select_for_date(
         "reel_source_article_id": reel_article.source_id,
         "reel_source_article_url": reel_article.url,
         "reel_source_article_title": reel_article.title,
+        "reel_source_article_content_html": reel_article.content_html,
         "reel_status": "SELECTED",
         "reel_job_id": "",
         "reel_part": 0,

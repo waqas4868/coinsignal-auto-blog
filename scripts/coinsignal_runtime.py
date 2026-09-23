@@ -1365,7 +1365,17 @@ def publisher_main() -> None:
 FACEBOOK_GRAPH_VERSION = os.environ.get("FACEBOOK_GRAPH_VERSION", "v26.0").strip() or "v26.0"
 QUEUE_FILE = Path("facebook_queue.json")
 STATE_FILE = Path("facebook_state.json")
-MAX_DAILY_POSTS = 3
+# Was 3 (this worker's own former total budget) before the CoinSignal Reels
+# pipeline (reels/) existed. The daily mix is now 1 Reel + 2 text/link posts
+# = 3 Facebook posts/day total; the Reel's own daily limit (1) is enforced
+# independently by reels/facebook_reel_queue.py's own queue, so this
+# worker's budget is just its own share, not the system-wide total.
+FACEBOOK_TEXT_DAILY_LIMIT = 2
+# Path to the Reel pipeline's daily article-selection record (read-only -
+# this worker never writes to it). Used only to skip the article already
+# chosen as today's Reel source, per "avoid selecting the Reel article for
+# a text post when two other valid articles exist."
+REEL_DAILY_SELECTION_FILE = Path("state/reel_daily_selection.json")
 WORKER_MAX_SECONDS = 45 * 60
 
 
@@ -1380,6 +1390,22 @@ def config() -> dict[str, str]:
         values[optional] = os.environ.get(optional, "").strip()
     values["BRANCH"] = os.environ.get("GITHUB_REF_NAME", "main").strip() or "main"
     return values
+
+
+def _todays_reel_source_article_id() -> str:
+    """Read-only lookup into the Reel pipeline's own state (never written
+    to from here - see reels/common.py for why this project keeps that
+    boundary structural, not just conventional). Returns "" if no Reel has
+    been selected for today or the file doesn't exist/parse."""
+    try:
+        record = read_json(REEL_DAILY_SELECTION_FILE, {})
+    except Exception:
+        return ""
+    if not isinstance(record, dict) or record.get("reel_status") != "SELECTED":
+        return ""
+    if record.get("reel_date") != pkt_date():
+        return ""
+    return str(record.get("reel_source_article_id", "")).strip()
 
 
 def load_facebook_queue() -> list[dict[str, Any]]:
@@ -1779,6 +1805,7 @@ def facebook_main() -> None:
     posted_this_run = 0
     eligible = []
     now = now_utc()
+    reel_source_id_today = _todays_reel_source_article_id()
 
     for item in queue:
         if item.get("status") not in {"pending", "retry"}:
@@ -1790,10 +1817,15 @@ def facebook_main() -> None:
                     continue
             except Exception:
                 pass
+        if reel_source_id_today and str(item.get("source_id", "")) == reel_source_id_today:
+            # This article is today's Reel source - the Reel pipeline (not this
+            # worker) is responsible for posting it, and posting it again here
+            # would exceed the 3-total-posts/day daily mix.
+            continue
         eligible.append(item)
     eligible.sort(key=lambda x: str(x.get("created_at", "")))
 
-    remaining_daily = max(0, MAX_DAILY_POSTS - int(state["count"]))
+    remaining_daily = max(0, FACEBOOK_TEXT_DAILY_LIMIT - int(state["count"]))
     print(f"Facebook queue: {len(eligible)} eligible, daily remaining={remaining_daily}")
     if remaining_daily == 0:
         print("Facebook daily limit reached; worker exits successfully.")
@@ -1913,7 +1945,7 @@ def facebook_main() -> None:
         save(queue, state, cfg, f"Block Facebook queue item {sid}")
         print("Facebook publish blocked:", detail)
 
-    print(f"Facebook worker complete. Posted this run: {posted_this_run}; daily total: {state['count']}/{MAX_DAILY_POSTS}")
+    print(f"Facebook worker complete. Posted this run: {posted_this_run}; daily total: {state['count']}/{FACEBOOK_TEXT_DAILY_LIMIT}")
 
 
 def runtime_preflight() -> None:

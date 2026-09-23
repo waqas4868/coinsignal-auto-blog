@@ -29,11 +29,17 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
 
+import requests
+
 from common import iso_now, write_json
+
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_MODEL = "gemini-3.8-flash"  # matches the article pipeline's own default (scripts/coinsignal_runtime.py)
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompt"
 ORIGINAL_PROMPT_PATH = PROMPT_DIR / "coinsignal_reel_prompt.txt"
@@ -339,3 +345,37 @@ def write_story_json(doc: dict[str, Any], date: str, base_dir: Path | None = Non
     out_path = root / date / "reel_story.json"
     write_json(out_path, doc)
     return out_path
+
+
+def generate_part_via_gemini(part_plan: dict[str, Any], source_data: dict[str, Any], prior_summary: str) -> dict[str, Any]:
+    """Real Gemini call for one Part (Phase 3's `generate_part` callable) -
+    schema-constrained JSON generation, same responseSchema pattern already
+    proven in scripts/coinsignal_runtime.py's generate_article() and
+    reel_planner.py. Reuses GEMINI_API_KEY (already configured); no new
+    secret needed. Not locally testable without that credential - same
+    limitation as every other live-API path built in this project so far.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
+    request_text = assemble_part_request(source_data, part_plan, prior_summary)
+    response = requests.post(
+        f"{GEMINI_API}/models/{GEMINI_MODEL}:generateContent",
+        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": request_text}]}],
+            "generationConfig": {"responseMimeType": "application/json", "responseSchema": PART_SCENE_SCHEMA},
+        },
+        timeout=180,
+    )
+    if not response.ok:
+        raise RuntimeError(f"Gemini part generation failed HTTP {response.status_code}: {response.text[:1200]}")
+
+    payload = response.json()
+    candidate = payload.get("candidates", [{}])[0]
+    parts = candidate.get("content", {}).get("parts", [])
+    text = next((p.get("text") for p in parts if isinstance(p, dict) and p.get("text")), None)
+    if not text:
+        raise RuntimeError("Gemini returned no text candidate for this Part")
+    return json.loads(text)

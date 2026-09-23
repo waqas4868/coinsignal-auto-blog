@@ -76,6 +76,7 @@ def test_selects_earliest_as_reel_and_next_two_as_text() -> None:
         assert result["reel_source_article_id"] == "c1", result  # earliest published
         assert result["text_post_article_ids"] == ["c2", "c3"], result  # next two chronologically
         assert result["reel_duration_seconds"] == 138, result
+        assert "COINSIGNAL_SOURCE_ID:c1" in result["reel_source_article_content_html"], result  # Phase 11: full content is persisted, not just id/url/title
         assert state_path.exists(), "SELECTED must persist state"
     print("PASS: selects earliest article for Reel, next two chronologically for text posts")
 
