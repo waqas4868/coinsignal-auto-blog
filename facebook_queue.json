@@ -178,5 +178,17 @@
     "created_at": "2026-09-22T22:33:30-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "cac41ea018d65dadae26",
+    "title": "BitMEX Ends Crypto Trading After 11 Years, Withdrawals Remain Open",
+    "summary": "BitMEX officially shuts down crypto exchange operations after over 11 years. Learn about the trading closure, open withdrawals, and next steps for users.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/bitmex-ends-crypto-trading-after-11.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/bitmex-ends-crypto-trading-after-11-years-withdrawals-remain-open-cac41ea018d65dadae26.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-23T02:38:39-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
