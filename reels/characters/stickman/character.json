@@ -1,0 +1,20 @@
+{
+  "name": "stickman",
+  "version": 1,
+  "style_reference": "Simple black stickman with a round head, clean smooth lines, minimalist style, expressive face, consistent proportions, medium line thickness, modern flat illustration, minimal white background, soft motivational emotional tone.",
+  "proportions": {
+    "canvas_width": 1280,
+    "canvas_height": 780,
+    "head_radius_px": 70,
+    "head_center_y_px": 220,
+    "torso_length_px": 220,
+    "arm_length_px": 150,
+    "leg_length_px": 200,
+    "line_width_px": 6,
+    "line_color": "#000000",
+    "background_color": "#FFFFFF"
+  },
+  "facial_reference": "Two small round dot eyes, no eyebrows, a single gently upward-curved mouth arc (soft neutral smile) - matches the prompt's own \"soft motivational emotional tone\" for the character's resting/neutral face. Per-scene expressions (shock, excitement, etc.) vary the mouth curve and add eyebrow marks but must keep the same head/eye proportions defined here.",
+  "reference_image": "reference.png",
+  "created_at": "2026-09-23T15:23:12+00:00"
+}
