@@ -58,5 +58,15 @@
     "facebook_video_id": "",
     "updated_at": "2026-09-22T21:34:01+00:00",
     "error_reason": "Reels start failed HTTP 400: {\"error\":{\"message\":\"Error validating access token: Session has expired on Tuesday, 22-Sep-26 03:00:00 PDT. The current time is Tuesday, 22-Sep-26 14:34:00 PDT.\",\"type\":\"OAuthException\",\"code\":190,\"error_subcode\":463,\"fbtrace_id\":\"Atys978ANAfNIW08kewQZ80\"}}"
+  },
+  {
+    "reel_job_id": "REEL-2026-09-23-NEWS-003976ba",
+    "article_source_id": "33ddc0cce682a1893a13",
+    "content_type": "news",
+    "created_at": "2026-09-23T17:04:43+00:00",
+    "state": "failed",
+    "facebook_video_id": "",
+    "updated_at": "2026-09-23T17:05:07+00:00",
+    "error_reason": "Gemini reel-plan request failed HTTP 503: {\n  \"error\": {\n    \"code\": 503,\n    \"message\": \"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\n    \"status\": \"UNAVAILABLE\"\n  }\n}\n"
   }
 ]
