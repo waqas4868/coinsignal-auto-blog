@@ -322,5 +322,17 @@
     "created_at": "2026-09-24T10:49:47-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "ac0880261bfa60828dcb",
+    "title": "DoubleZero Launches Dedicated Fiber Market Data for Hyperliquid Traders",
+    "summary": "DoubleZero has introduced a dedicated fiber market data feed for Hyperliquid, providing professional trading firms with low-latency full order book access.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/doublezero-launches-dedicated-fiber.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/doublezero-launches-dedicated-fiber-market-data-for-hyperliquid-traders-ac0880261bfa60828dcb.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-24T13:19:07-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
