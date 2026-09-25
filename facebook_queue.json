@@ -358,5 +358,17 @@
     "created_at": "2026-09-24T22:54:45-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "19750724d2a64b183dd0",
+    "title": "Magic Eden Security Alert: 3,832 NFTs Placed in Whitehat Custody",
+    "summary": "A security scare involving Magic Eden led to 3,832 NFTs being moved into whitehat custody. Yuga Labs' 0xQuit urges asset holders to revoke permissions.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/magic-eden-security-alert-3832-nfts.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/magic-eden-security-alert-3-832-nfts-placed-in-whitehat-custody-19750724d2a64b183dd0.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-25T02:55:17-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
