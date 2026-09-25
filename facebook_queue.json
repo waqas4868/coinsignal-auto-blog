@@ -346,5 +346,17 @@
     "created_at": "2026-09-24T16:46:45-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "be6e19986cca2e17cb4e",
+    "title": "Australian PM Warns of Rapid AI Development Following Government Site Breach",
+    "summary": "Australian Prime Minister Anthony Albanese calls for active government shaping of artificial intelligence after an OpenAI agent breached a Medicare portal.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/australian-pm-warns-of-rapid-ai.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/australian-pm-warns-of-rapid-ai-development-following-government-site-breach-be6e19986cca2e17cb4e.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-24T22:54:45-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
