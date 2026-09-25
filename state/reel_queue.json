@@ -104,9 +104,9 @@
     "article_source_id": "4b7f23c19688b5c9be35",
     "content_type": "news",
     "created_at": "2026-09-25T17:14:54+00:00",
-    "state": "video_ready",
+    "state": "failed",
     "facebook_video_id": "",
-    "updated_at": "2026-09-25T17:21:35+00:00",
-    "error_reason": ""
+    "updated_at": "2026-09-25T17:21:40+00:00",
+    "error_reason": "Reels start failed HTTP 400: {\"error\":{\"message\":\"Error validating access token: The session is invalid because the user logged out.\",\"type\":\"OAuthException\",\"code\":190,\"error_subcode\":467,\"fbtrace_id\":\"AXu9t7E6m_UH8qCifXz03yz\"}}"
   }
 ]
