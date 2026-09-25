@@ -370,5 +370,17 @@
     "created_at": "2026-09-25T02:55:17-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "4b7f23c19688b5c9be35",
+    "title": "IRS Crypto Gain Reporting Creates Cost-Basis Confusion for Investors",
+    "summary": "Cryptocurrency investors face a growing reporting challenge as the IRS tracks digital asset gains without clear visibility into the associated cost-basis.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/irs-crypto-gain-reporting-creates-cost.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/irs-crypto-gain-reporting-creates-cost-basis-confusion-for-investors-4b7f23c19688b5c9be35.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-25T07:17:28-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
