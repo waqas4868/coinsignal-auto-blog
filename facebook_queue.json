@@ -394,5 +394,17 @@
     "created_at": "2026-09-25T10:54:41-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "fc564844eeb6640f9014",
+    "title": "Tether Reports Limited Exposure Following $84M US Banking Seizure",
+    "summary": "Tether confirms limited exposure to EQIBank following an $84 million US asset seizure over alleged illegal payment processor transfers.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/tether-reports-limited-exposure.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/tether-reports-limited-exposure-following-84m-us-banking-seizure-fc564844eeb6640f9014.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-25T13:19:13-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
