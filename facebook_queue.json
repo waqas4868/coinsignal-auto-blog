@@ -406,5 +406,17 @@
     "created_at": "2026-09-25T13:19:13-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "f9319de5ad66348d9899",
+    "title": "OG.com Files for CFTC Approval of Single-Stock Perpetual Futures",
+    "summary": "OG.com, recently spun out of Crypto.com, has joined Coinbase, Kalshi, and Kraken's parent Payward in seeking CFTC approval for single-stock perpetual futures.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/ogcom-files-for-cftc-approval-of-single.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/og-com-files-for-cftc-approval-of-single-stock-perpetual-futures-f9319de5ad66348d9899.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-25T16:50:58-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
