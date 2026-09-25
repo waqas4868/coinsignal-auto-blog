@@ -382,5 +382,17 @@
     "created_at": "2026-09-25T07:17:28-07:00",
     "next_attempt_at": "",
     "last_error": ""
+  },
+  {
+    "source_id": "6b7fe47cd22aa3870ad3",
+    "title": "Bitget Clarifies $388M in Assets Impacted Following Security Incident",
+    "summary": "Cryptocurrency exchange Bitget has clarified that its recent security breach impacted $388 million in assets, according to recent blockchain asset analysis.",
+    "article_url": "https://blogsdrip4u.blogspot.com/2026/09/bitget-clarifies-388m-in-assets.html",
+    "image_url": "https://raw.githubusercontent.com/waqas4868/coinsignal-auto-blog/main/generated_images/bitget-clarifies-388m-in-assets-impacted-following-security-incident-6b7fe47cd22aa3870ad3.png",
+    "status": "pending",
+    "attempts": 0,
+    "created_at": "2026-09-25T10:54:41-07:00",
+    "next_attempt_at": "",
+    "last_error": ""
   }
 ]
