@@ -218,5 +218,15 @@
     "facebook_video_id": "",
     "updated_at": "2026-09-30T22:25:48+00:00",
     "error_reason": "400 Client Error: Bad Request for url: https://oauth2.googleapis.com/token"
+  },
+  {
+    "reel_job_id": "REEL-2026-10-01-NEWS-84d5d34f",
+    "article_source_id": "",
+    "content_type": "news",
+    "created_at": "2026-10-01T18:37:59+00:00",
+    "state": "failed",
+    "facebook_video_id": "",
+    "updated_at": "2026-10-01T18:37:59+00:00",
+    "error_reason": "400 Client Error: Bad Request for url: https://oauth2.googleapis.com/token"
   }
 ]
